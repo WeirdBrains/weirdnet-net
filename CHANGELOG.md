@@ -2,10 +2,13 @@
 
 All notable changes to weirdnet-net are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-[Semantic Versioning](https://semver.org/). The next release is 0.2.0: the changes below
-break the 0.1 API.
+[Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+### Fixed
+
+- A request or dial through a relay no longer fails while the node is still connecting to that relay.
 
 ## [0.2.0] - 2026-11-16
 

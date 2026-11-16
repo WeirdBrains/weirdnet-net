@@ -7,7 +7,7 @@
 //! The swarm runs on its own thread with a small Tokio runtime. [`Node`] is a blocking
 //! handle (the CLI and TUI are synchronous): requests wait for their answer. Requests
 //! that come in are answered by a [`Handler`] on Tokio's blocking pool.
-use crate::addr::{addr_peer, reach_rank, routable, shareable};
+use crate::addr::{addr_peer, circuit_relay, reach_rank, routable, shareable};
 use crate::error::{NetError, Result};
 use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
 use crate::profile::Profile;
@@ -658,7 +658,13 @@ struct Loop<Q: Message, R: Message> {
     gets: HashMap<kad::QueryId, Gathering>,
     finds: HashMap<kad::QueryId, Finding>,
     addr_book: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Commands that go through a relay we are still connecting to (a bootstrap dial to the
+    /// same relay under way makes libp2p's relay transport skip its own dial and fail).
+    deferred: Vec<(PeerId, std::time::Instant, Cmd<Q, R>)>,
 }
+
+/// How long a command waits for its relay connection before it is tried anyway.
+const RELAY_WAIT: Duration = Duration::from_secs(10);
 
 impl<Q: Message, R: Message> Loop<Q, R> {
     fn new(
@@ -691,6 +697,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             gets: HashMap::new(),
             finds: HashMap::new(),
             addr_book: HashMap::new(),
+            deferred: vec![],
         }
     }
 
@@ -785,7 +792,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                 }
                 _ = tick.tick() => self.periodic(),
-                _ = check.tick() => self.retry_stuck_reservations(),
+                _ = check.tick() => {
+                    self.retry_stuck_reservations();
+                    self.release_deferred(None);
+                }
             }
         }
         for (_, tx) in self.pending.drain() {
@@ -861,6 +871,35 @@ impl<Q: Message, R: Message> Loop<Q, R> {
     }
 
     fn command(&mut self, c: Cmd<Q, R>) {
+        let addrs: Vec<Multiaddr> = match &c {
+            Cmd::Request { addrs, .. } | Cmd::Names { addrs, .. } => addrs.clone(),
+            Cmd::Dial { addr, .. } => vec![addr.clone()],
+            _ => vec![],
+        };
+        // through a relay we aren't connected to yet: connect to it first (or wait for the
+        // dial already under way), then send
+        let waiting = addrs.iter().filter_map(circuit_relay).find(|(r, _)| *r != *self.swarm.local_peer_id() && !self.swarm.is_connected(r));
+        if let Some((relay, raddr)) = waiting {
+            use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+            let _ = self.swarm.dial(DialOpts::peer_id(relay).addresses(vec![raddr]).condition(PeerCondition::DisconnectedAndNotDialing).build());
+            self.deferred.push((relay, std::time::Instant::now(), c));
+            return;
+        }
+        self.execute(c);
+    }
+
+    /// Send the commands that waited for `relay` (connected, or its dial failed), or every
+    /// one that waited too long (`None`).
+    fn release_deferred(&mut self, relay: Option<PeerId>) {
+        let (ready, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.deferred).into_iter().partition(|(r, at, _)| relay.map_or(at.elapsed() > RELAY_WAIT, |p| p == *r));
+        self.deferred = keep;
+        for (_, _, c) in ready {
+            self.execute(c);
+        }
+    }
+
+    fn execute(&mut self, c: Cmd<Q, R>) {
         match c {
             Cmd::Request { peer, addrs, wire, reply } => {
                 for a in addrs {
@@ -955,6 +994,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             SwarmEvent::ExternalAddrExpired { .. } | SwarmEvent::ExpiredListenAddr { .. } => self.refresh(),
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                self.release_deferred(Some(peer_id));
                 let addr = endpoint.get_remote_address().clone();
                 if endpoint.is_dialer() {
                     let a = if addr_peer(&addr) == Some(peer_id) { addr.clone() } else { addr.clone().with(Protocol::P2p(peer_id)) };
@@ -977,6 +1017,11 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             SwarmEvent::ConnectionClosed { .. } => self.refresh(),
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(p) = peer_id
+                    && !self.swarm.is_connected(&p)
+                {
+                    self.release_deferred(Some(p));
+                }
                 let msg = error.to_string();
                 let mut i = 0;
                 while i < self.dials.len() {

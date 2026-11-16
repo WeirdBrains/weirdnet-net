@@ -95,3 +95,26 @@ fn an_unlimited_relay_carries_large_answers() {
         }
     }
 }
+
+#[test]
+fn the_first_request_through_a_relay_waits_for_the_bootstrap_dial() {
+    // A bootstraps from the relay and asks B through the relay's circuit straight away,
+    // while its bootstrap dial to the same relay is still under way.
+    for _ in 0..5 {
+        let (relay, b, _a, circuit) = line_up(RelayLimits::unlimited());
+        let raddr: Multiaddr = relay.reachable_addrs().into_iter().find(|a| a.starts_with("/memory/")).unwrap().parse().unwrap();
+        let a = Node::start(&WEIRDNET, Keypair::generate_ed25519(), NodeConfig { bootstrap: vec![raddr], ..mem(false) }, Arc::new(Blobs)).unwrap();
+        match a.request(b.peer_id(), std::slice::from_ref(&circuit), Q::Get(16)).unwrap() {
+            R::Blob(v) => assert_eq!(v.len(), 16),
+        }
+        // and a plain dial of the circuit too
+        let a2 = Node::<Q, R>::start(
+            &WEIRDNET,
+            Keypair::generate_ed25519(),
+            NodeConfig { bootstrap: vec![crate::addr::circuit_relay(&circuit).unwrap().1], ..mem(false) },
+            Arc::new(Blobs),
+        )
+        .unwrap();
+        assert_eq!(a2.dial(circuit.clone()).unwrap(), b.peer_id());
+    }
+}

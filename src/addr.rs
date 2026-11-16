@@ -9,6 +9,22 @@ pub fn addr_peer(a: &Multiaddr) -> Option<PeerId> {
 }
 
 /// Parse addresses, skipping bad ones.
+/// The relay of a circuit address (`…/p2p/RELAY/p2p-circuit/…`): its peer id and address.
+pub fn circuit_relay(a: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    let mut relay = Multiaddr::empty();
+    let mut peer = None;
+    for p in a.iter() {
+        if p == Protocol::P2pCircuit {
+            return peer.map(|id| (id, relay));
+        }
+        if let Protocol::P2p(id) = p {
+            peer = Some(id);
+        }
+        relay.push(p);
+    }
+    None
+}
+
 pub fn parse_addrs<S: AsRef<str>>(v: &[S]) -> Vec<Multiaddr> {
     v.iter().filter_map(|s| s.as_ref().trim().parse().ok()).collect()
 }
@@ -68,19 +84,6 @@ pub fn reach_rank(a: &Multiaddr) -> u8 {
     r * 2 + quic as u8
 }
 
-/// The relay a circuit address (`…/p2p/RELAY/p2p-circuit[/p2p/PEER]`) goes through.
-fn circuit_relay(a: &Multiaddr) -> Option<PeerId> {
-    let mut relay = None;
-    for p in a.iter() {
-        match p {
-            Protocol::P2p(id) => relay = Some(id),
-            Protocol::P2pCircuit => return relay,
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Keep one circuit address per relay, the most reachable one (a relay the user named
 /// first). libp2p dials the relay once per circuit address and the first of those dials to
 /// fail cancels the others, so many addresses for one relay (a relay listens on Docker,
@@ -95,7 +98,7 @@ pub fn one_circuit_per_relay(addrs: Vec<Multiaddr>, configured: &[Multiaddr]) ->
     for a in addrs {
         match circuit_relay(&a) {
             None => out.push(a),
-            Some(r) => match best.iter_mut().find(|(p, _)| *p == r) {
+            Some((r, _)) => match best.iter_mut().find(|(p, _)| *p == r) {
                 Some((_, b)) if rank(&a) < rank(b) => *b = a,
                 Some(_) => {}
                 None => best.push((r, a)),
