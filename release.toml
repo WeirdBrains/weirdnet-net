@@ -1,0 +1,54 @@
+# weirdnet-net release config for the shared WeirdBrains release script
+# (scripts/weirdnet_release.py, vendored byte-identical from weirdnet-project-helpers; never edit it).
+#
+#   python3 scripts/weirdnet_release.py --dry-run "Short summary"   # then without --dry-run
+#
+# A release publishes the crate to crates.io. 0.1.0 was published before this config existed
+# and has no git tag.
+helpers = "0.3.0"
+project = "weirdnet-net"
+timezone = "America/New_York"
+
+[[files]]
+kind = "cargo-package"
+path = "Cargo.toml"
+primary = true
+
+[[files]]
+kind = "cargo-lock"
+path = "Cargo.lock"
+
+[changelog]
+path = "CHANGELOG.md"
+default_section = "Added"
+
+[checks]
+commands = [
+  "cargo fmt --check",
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo test --locked",
+  "cargo package --locked",
+]
+
+[crates]
+publish = ["."]
+
+[[platforms]]
+os = "linux"
+opt_out = "a library crate, published on crates.io; apps ship the binaries"
+
+[[platforms]]
+os = "macos"
+opt_out = "a library crate, published on crates.io; apps ship the binaries"
+
+[[platforms]]
+os = "windows"
+opt_out = "a library crate, published on crates.io; apps ship the binaries"
+
+[[platforms]]
+os = "android"
+opt_out = "a library crate, published on crates.io; apps ship the binaries"
+
+[[platforms]]
+os = "ios"
+opt_out = "a library crate, published on crates.io; apps ship the binaries"

@@ -11,7 +11,7 @@ documentation = "https://docs.rs/weirdnet-net"
 readme = "README.md"
 keywords = ["p2p", "libp2p", "key-exchange", "invitation", "decentralized"]
 categories = ["network-programming"]
-include = ["src/**", "README.md", "SECURITY.md", "LICENSE"]
+include = ["src/**", "README.md", "SECURITY.md", "CHANGELOG.md", "LICENSE"]
 
 [dependencies]
 thiserror = "2"
