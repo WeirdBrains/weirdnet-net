@@ -6,6 +6,8 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - Streams with no size cap, backpressure and per-protocol limits, for any number of apps' protocols on one node.
@@ -57,5 +59,6 @@ All notable changes to weirdnet-net are listed here. The format follows
 - First release, extracted from Muninn: the Weirdnet libp2p node with identities, Kademlia,
   relays, hole punching and request-response protocols.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WeirdBrains/weirdnet-net/releases/tag/v0.2.0
