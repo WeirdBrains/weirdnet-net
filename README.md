@@ -67,6 +67,18 @@ response types, its own storage and its own policy; the crate brings the wire.
   changed chunks and an interrupted fetch picks up where it stopped. `fetch_range` gets only
   the chunks under a byte range and `read_range` reads it. Public content goes in the DHT
   with `Node::provide(&provider_key(&root))` and is found with `Node::providers`.
+- `member` and `join`: lasting membership. A `Membership` (resource, member's user id, a
+  role id the application interprets, issued and optional expiry times) is signed by the
+  owner's user key; a `MemberRevocation` voids a user's memberships of a resource issued up
+  to a time, and travels in the content `Manifest` (`member_revocations`) or any way the app
+  likes, collected in `Revocations`. A member's node presents the membership with its user's
+  card on a stream (`present`); the host checks it is valid, unrevoked and the card's
+  certificate is for the very node speaking (`read_presented`, `check_presented`). To ask for
+  membership, a user signs a `JoinRequest` and sends it on `/weirdnet/join/1`
+  (`request_join`); `serve_joins` checks it, applies per-user and per-node rate limits and a
+  cap on pending requests, and keeps it in the app's `JoinQueue`. The owner `approve`s (a
+  membership) or `deny`s (a signed `Denial`), and sending the same request again fetches the
+  answer.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
