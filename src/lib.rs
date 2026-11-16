@@ -15,7 +15,7 @@ pub use error::{NetError, Result};
 pub use exchange::{Answer, DEFAULT_TTL_MS, Derived, Offer, Token, normalize_code};
 pub use libp2p::identity::{Keypair, PublicKey};
 pub use libp2p::{Multiaddr, PeerId};
-pub use node::{Handler, Message, Node, NodeConfig, Sighting, Status};
+pub use node::{Handler, Message, Node, NodeConfig, RelayLimits, Sighting, Status};
 pub use profile::{Profile, WEIRDNET};
 pub use weirdnet_keys::{Key32, Sealed};
 
@@ -29,5 +29,7 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[cfg(test)]
+mod relay_tests;
 #[cfg(test)]
 mod tests;

@@ -55,6 +55,91 @@ pub struct NodeConfig {
     /// The application's version, in the identify agent (`NAME/VERSION`); empty: this
     /// crate's version.
     pub version: String,
+    /// What the relay server (`relay_server`) allows; the default is libp2p's.
+    pub relay_limits: RelayLimits,
+}
+
+/// Limits of the relay server: how many reservations and circuits it holds, and how long
+/// and how much one circuit may carry. [`RelayLimits::default`] keeps libp2p's defaults
+/// (circuits for hole punching and small requests: 2 minutes, 128 KiB);
+/// [`RelayLimits::data`] lets circuits carry data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// Reservations held at once, and per peer.
+    pub max_reservations: usize,
+    pub max_reservations_per_peer: usize,
+    /// How long a reservation lasts before the client renews it.
+    pub reservation_duration: Duration,
+    /// Circuits open at once, and per peer.
+    pub max_circuits: usize,
+    pub max_circuits_per_peer: usize,
+    /// How long one circuit may stay open (at most `u32::MAX` seconds).
+    pub max_circuit_duration: Duration,
+    /// How many bytes one circuit may carry in each direction; 0: no limit.
+    pub max_circuit_bytes: u64,
+}
+
+impl Default for RelayLimits {
+    /// libp2p's defaults.
+    fn default() -> Self {
+        let c = relay::Config::default();
+        RelayLimits {
+            max_reservations: c.max_reservations,
+            max_reservations_per_peer: c.max_reservations_per_peer,
+            reservation_duration: c.reservation_duration,
+            max_circuits: c.max_circuits,
+            max_circuits_per_peer: c.max_circuits_per_peer,
+            max_circuit_duration: c.max_circuit_duration,
+            max_circuit_bytes: c.max_circuit_bytes,
+        }
+    }
+}
+
+impl RelayLimits {
+    /// Longest circuit duration libp2p accepts.
+    pub const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(u32::MAX as u64);
+
+    /// Circuits that carry data: no byte limit, a day per circuit, and room for more
+    /// reservations (1024, 8 per peer) and circuits (1024, 16 per peer).
+    pub fn data() -> Self {
+        RelayLimits {
+            max_reservations: 1024,
+            max_reservations_per_peer: 8,
+            max_circuits: 1024,
+            max_circuits_per_peer: 16,
+            max_circuit_duration: Duration::from_secs(24 * 3600),
+            max_circuit_bytes: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Refuse limits libp2p cannot apply (a zero count or duration, or a circuit duration
+    /// over `u32::MAX` seconds).
+    pub fn check(&self) -> Result<()> {
+        if self.max_reservations == 0 || self.max_reservations_per_peer == 0 || self.max_circuits == 0 || self.max_circuits_per_peer == 0 {
+            return Err(NetError::invalid("relay limits", "reservation and circuit counts must be at least 1"));
+        }
+        if self.reservation_duration.is_zero() || self.max_circuit_duration.is_zero() {
+            return Err(NetError::invalid("relay limits", "durations must be longer than zero"));
+        }
+        if self.max_circuit_duration > Self::MAX_CIRCUIT_DURATION {
+            return Err(NetError::invalid("relay limits", "a circuit may last at most u32::MAX seconds"));
+        }
+        Ok(())
+    }
+
+    fn config(&self) -> relay::Config {
+        relay::Config {
+            max_reservations: self.max_reservations,
+            max_reservations_per_peer: self.max_reservations_per_peer,
+            reservation_duration: self.reservation_duration,
+            max_circuits: self.max_circuits,
+            max_circuits_per_peer: self.max_circuits_per_peer,
+            max_circuit_duration: self.max_circuit_duration,
+            max_circuit_bytes: self.max_circuit_bytes,
+            ..relay::Config::default()
+        }
+    }
 }
 
 impl NodeConfig {
@@ -109,18 +194,26 @@ pub struct Status {
     pub started_at: i64,
 }
 
-#[derive(NetworkBehaviour)]
-struct Behaviour<Q: Message, R: Message> {
-    rr: request_response::cbor::Behaviour<Q, R>,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
-    kad: kad::Behaviour<MemoryStore>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    relay_client: relay::client::Behaviour,
-    relay_server: Toggle<relay::Behaviour>,
-    dcutr: dcutr::Behaviour,
-    autonat: autonat::Behaviour,
+// rustc 1.100 flags code the `NetworkBehaviour` derive generates (matches on
+// uninhabited events) as unreachable; the allow has to sit on a module to reach it.
+#[allow(unreachable_code)]
+mod wire {
+    use super::*;
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour<Q: Message, R: Message> {
+        pub(super) rr: request_response::cbor::Behaviour<Q, R>,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+        pub(super) kad: kad::Behaviour<MemoryStore>,
+        pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(super) relay_client: relay::client::Behaviour,
+        pub(super) relay_server: Toggle<relay::Behaviour>,
+        pub(super) dcutr: dcutr::Behaviour,
+        pub(super) autonat: autonat::Behaviour,
+    }
 }
+use wire::{Behaviour, BehaviourEvent};
 
 enum Cmd<Q, R> {
     Request { peer: PeerId, addrs: Vec<Multiaddr>, wire: Q, reply: oneshot::Sender<Result<R>> },
@@ -169,7 +262,7 @@ fn behaviour<Q: Message, R: Message>(
     kcfg.set_query_timeout(Duration::from_secs(30));
     let kad = kad::Behaviour::with_config(peer, MemoryStore::new(peer), kcfg);
     let mdns = if cfg.mdns && !cfg.memory { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer).map_err(net_err)?) } else { None };
-    let relay_server = cfg.relay_server.then(|| relay::Behaviour::new(peer, relay::Config::default()));
+    let relay_server = cfg.relay_server.then(|| relay::Behaviour::new(peer, cfg.relay_limits.config()));
     let autonat = autonat::Behaviour::new(peer, autonat::Config { only_global_ips: !cfg.memory, ..Default::default() });
     Ok(Behaviour {
         rr,
@@ -231,6 +324,9 @@ fn build_swarm<Q: Message, R: Message>(p: &'static Profile, key: Keypair, cfg: &
 impl<Q: Message, R: Message> Node<Q, R> {
     /// Start a node speaking `profile`; returns once its listeners are up (or failed).
     pub fn start(profile: &'static Profile, key: Keypair, cfg: NodeConfig, handler: Arc<dyn Handler<Q, R>>) -> Result<Self> {
+        if cfg.relay_server {
+            cfg.relay_limits.check()?;
+        }
         let peer_id = key.public().to_peer_id();
         let status = Arc::new(Mutex::new(Status {
             peer_id: peer_id.to_string(),

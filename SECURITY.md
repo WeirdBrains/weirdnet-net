@@ -42,8 +42,14 @@ What the crate leaves to the application:
 - A link grant hands the user's signing key to the node being linked (sealed under the link
   exchange); that is by design and only for the user's own nodes.
 
-Tested over libp2p's in-memory transport (real Noise, Yamux and request-response); TCP and
-QUIC sockets, relays, hole punching, mDNS and AutoNAT are not exercised by the tests.
+Tested over libp2p's in-memory transport (real Noise, Yamux and request-response), including
+a request answered through a relay circuit under the default and the data limits; TCP and
+QUIC sockets, hole punching, mDNS and AutoNAT are not exercised by the tests.
+
+Relay limits: `RelayLimits::data()` removes the per-circuit byte cap and allows day-long
+circuits, so a relay running it carries whatever its clients send (libp2p's per-peer and
+per-IP reservation and circuit rate limiters still apply). Bandwidth controls are the
+operator's.
 
 Not verified: an audit, fuzzing, Windows, macOS, iOS and Android, an MSRV run and minimal
 dependency versions. Requests up to 8 MiB and answers up to 256 MiB are accepted, with a

@@ -9,6 +9,9 @@ response types, its own storage and its own policy; the crate brings the wire.
   and Yamux, mDNS, Kademlia, identify, ping, a relay client and an opt-in relay server,
   DCUtR hole punching and AutoNAT. The swarm runs on its own thread; the handle is blocking.
   Requests are the application's `Q`, answers its `R` (CBOR), answered by a `Handler`.
+  `NodeConfig::relay_limits` sets what the relay server allows: `RelayLimits::default()`
+  keeps libp2p's (2-minute, 128 KiB circuits, enough for hole punching and small requests),
+  `RelayLimits::data()` lets circuits carry data (no byte limit, a day per circuit).
 - `exchange`: signed offers and answers (Ed25519 node keys, fresh X25519 keys), the derived
   exchange key, a ten-digit short code and a fingerprint to compare out of band, tokens and
   links (invitations), scopes with an expiry, and sealed messages bound to the exchange and
