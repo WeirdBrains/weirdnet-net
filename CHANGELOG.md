@@ -18,6 +18,7 @@ All notable changes to weirdnet-net are listed here. The format follows
 - CI builds for Android and iOS and tests on macOS and Windows.
 - WebSocket over TLS: dial `/tls/ws` and `/wss` addresses, and listen on them with a certificate.
 - SNI-passthrough ingress: signed grants, DNS-bound names, PROXY v2 headers, HTTP-01 on port 80, per-site revocation.
+- Ingress names served on the device itself go to a local listener, so a relay's own WSS shares port 443.
 - dnsaddr_record, dnsaddr_txt and dnsaddr_dial for `/dnsaddr` names, and a DNS servers setting.
 
 ### Fixed

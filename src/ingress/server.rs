@@ -5,7 +5,7 @@ use super::{GRANT_PROTOCOL, IngressGrant, MAX_REGISTRATION, proxy, read_msg, wri
 use crate::error::{NetError, Result};
 use crate::node::{Message, Node, Opener};
 use crate::profile::Profile;
-use crate::stream::{Incoming, Limits, Stream};
+use crate::stream::{Incoming, Limits};
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{Multiaddr, PeerId};
 use std::collections::{HashMap, HashSet};
@@ -32,11 +32,22 @@ pub struct IngressConfig {
     pub hello_timeout: Duration,
     /// Names one user may register on this ingress.
     pub max_names_per_user: usize,
+    /// Names this device serves itself on the same port, and the local address that does
+    /// (a relay's own WebSocket-over-TLS listener): passed there as they are, no PROXY header.
+    pub local: Vec<(String, SocketAddr)>,
 }
 
 impl Default for IngressConfig {
     fn default() -> Self {
-        IngressConfig { https: None, http: None, enabled: true, blocked: vec![], hello_timeout: Duration::from_secs(10), max_names_per_user: 64 }
+        IngressConfig {
+            https: None,
+            http: None,
+            enabled: true,
+            blocked: vec![],
+            hello_timeout: Duration::from_secs(10),
+            max_names_per_user: 64,
+            local: vec![],
+        }
     }
 }
 
@@ -60,6 +71,7 @@ struct Inner {
     opener: Opener,
     max_names: usize,
     hello_timeout: Duration,
+    local: HashMap<String, SocketAddr>,
 }
 
 /// A running ingress. Dropping it stops taking connections and registrations.
@@ -93,6 +105,7 @@ impl Ingress {
             opener: node.opener(super::INGRESS_PROTOCOL, Limits::default()),
             max_names: cfg.max_names_per_user,
             hello_timeout: cfg.hello_timeout,
+            local: cfg.local.iter().filter_map(|(n, a)| Some((sni::host_name(n.as_bytes())?, *a))).collect(),
         });
         let regs = node.accept_streams(GRANT_PROTOCOL, Limits { backlog: 64, ..Limits::default() })?;
         let mut tasks = vec![rt.spawn(registrations(inner.clone(), regs))];
@@ -277,6 +290,12 @@ async fn forward_tls(inner: &Inner, mut tcp: TcpStream, client: SocketAddr, loca
     })
     .await
     .map_err(|_| "no ClientHello in time".to_string())??;
+    if let Some(to) = inner.local.get(&name) {
+        let mut l = TcpStream::connect(to).await.map_err(|e| format!("local {to}: {e}"))?;
+        tokio::io::AsyncWriteExt::write_all(&mut l, &buf).await.map_err(|e| e.to_string())?;
+        splice(tcp, l.compat()).await;
+        return Ok(());
+    }
     let site = inner.site(&name).ok_or_else(|| format!("{name} is not forwarded here"))?;
     let mut s = (inner.opener)(site.host, site.addrs.clone()).await.map_err(|e| format!("cannot reach the host of {name}: {e}"))?;
     s.write_all(&proxy::encode(client, local, &name, false)).await.map_err(|e| e.to_string())?;
@@ -340,7 +359,7 @@ async fn forward_http(inner: &Inner, mut tcp: TcpStream, client: SocketAddr, loc
 }
 
 /// Copy both ways until both sides have closed.
-async fn splice(tcp: TcpStream, s: Stream) {
+async fn splice<S: futures::AsyncRead + futures::AsyncWrite + Unpin>(tcp: TcpStream, s: S) {
     let (tr, tw) = tcp.compat().split();
     let (sr, sw) = s.split();
     let up = async move {

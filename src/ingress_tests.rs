@@ -284,3 +284,25 @@ fn sni_is_read_from_a_real_client_hello_in_pieces() {
     assert_eq!(sni::peek(&two), sni::Hello::Name(SITE.into()));
     assert_eq!(sni::peek(b"GET / HTTP/1.1\r\n"), sni::Hello::Bad);
 }
+
+#[test]
+fn a_name_served_here_goes_to_its_local_listener() {
+    // a local TLS-less "listener" that just records the first bytes
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = l.local_addr().unwrap();
+    let ingress_node = start(mem(true));
+    let cfg = IngressConfig { https: Some("127.0.0.1:0".parse().unwrap()), local: vec![("Relay.Example.com".into(), local)], ..Default::default() };
+    let ingress = Ingress::start(&ingress_node, cfg, Arc::new(StaticBinding::default())).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let addr = ingress.https_addr().unwrap();
+    let (cert, _) = certs();
+    let t = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = std::io::Read::read(&mut c, &mut buf).unwrap();
+        sni::peek(&buf[..n])
+    });
+    // the client's handshake goes nowhere (no TLS on the local side); only the routing matters
+    let _ = rt.block_on(async { tokio::time::timeout(Duration::from_secs(3), browse(addr, cert, "relay.example.com")).await });
+    assert_eq!(t.join().unwrap(), sni::Hello::Name("relay.example.com".into()));
+}

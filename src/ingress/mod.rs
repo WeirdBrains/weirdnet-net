@@ -14,6 +14,8 @@
 //! binds the name to that user (`_weirdnet.<name> TXT "v=1 user=<id>"`). Registrations last
 //! until the grant expires or the ingress restarts, so hosts register again now and then.
 //! Every ingress can refuse a name ([`Ingress::revoke`]) or stop forwarding ([`Ingress::set_enabled`]).
+//! Names the device serves itself on the same port (a relay's own WebSocket-over-TLS
+//! listener behind 443) go to a local address untouched ([`IngressConfig::local`]).
 //! HTTP/3 isn't passed through (QUIC hides the SNI). Per-grant byte and connection limits
 //! come later.
 //!
