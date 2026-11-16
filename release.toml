@@ -27,7 +27,7 @@ commands = [
   "cargo fmt --check",
   "cargo clippy --locked --all-targets -- -D warnings",
   "cargo test --locked",
-  "cargo package --locked",
+  "cargo package --locked --allow-dirty",   # runs on the bumped, not yet committed tree
 ]
 
 [crates]
