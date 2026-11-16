@@ -5,7 +5,7 @@
 #
 # A release publishes the crate to crates.io. 0.1.0 was published before this config existed
 # and has no git tag.
-helpers = "0.3.1"
+helpers = "0.3.2"
 project = "weirdnet-net"
 timezone = "America/New_York"
 
