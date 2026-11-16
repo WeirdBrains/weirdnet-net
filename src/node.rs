@@ -488,6 +488,11 @@ impl<Q: Message, R: Message> Node<Q, R> {
         }
     }
 
+    /// The identifier profile the node speaks.
+    pub fn profile(&self) -> &'static Profile {
+        self.profile
+    }
+
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
     }
@@ -746,6 +751,51 @@ impl<Q: Message, R: Message> Node<Q, R> {
         futures::executor::block_on(self.open_stream_async(peer, addrs, protocol, limits))
     }
 
+    /// Forwarded HTTPS connections for this node's sites ([`crate::ingress`]).
+    pub fn accept_ingress(&self) -> Result<crate::ingress::IngressIncoming> {
+        Ok(crate::ingress::IngressIncoming { inc: self.accept_streams(crate::ingress::INGRESS_PROTOCOL, Limits::default())? })
+    }
+
+    /// Register this node's sites with an ingress peer: `reg` carries the user's grants for
+    /// that ingress, the user's certificate for this node and where the ingress reaches it.
+    pub fn register_ingress(&self, ingress: PeerId, addrs: &[Multiaddr], reg: &crate::ingress::Registration) -> Result<crate::ingress::Registered> {
+        use futures::AsyncWriteExt;
+        let body = serde_json::to_vec(reg).map_err(|e| NetError::invalid("registration", e.to_string()))?;
+        let mut s = self.open_stream(ingress, addrs, crate::ingress::GRANT_PROTOCOL, Limits::default())?;
+        let rt = self.streams.0.clone();
+        rt.block_on(async move {
+            crate::ingress::write_msg(&mut s, &body).await.map_err(NetError::net)?;
+            let _ = s.close().await;
+            let b = tokio::time::timeout(Duration::from_secs(60), crate::ingress::read_msg(&mut s, crate::ingress::MAX_REGISTRATION))
+                .await
+                .map_err(|_| NetError::Network("no answer from the ingress".into()))?
+                .map_err(NetError::net)?;
+            serde_json::from_slice(&b).map_err(|e| NetError::invalid("registration answer", e.to_string()))
+        })
+    }
+
+    pub(crate) fn runtime(&self) -> tokio::runtime::Handle {
+        self.streams.0.clone()
+    }
+
+    pub(crate) fn opener(&self, protocol: &str, limits: Limits) -> Opener {
+        let tx = self.tx.clone();
+        let control = self.streams.1.clone();
+        let p = StreamProtocol::try_from_owned(protocol.to_string()).expect("a valid protocol id");
+        Arc::new(move |peer, addrs| {
+            let (tx, control, p) = (tx.clone(), control.clone(), p.clone());
+            Box::pin(async move {
+                let (rtx, rrx) = oneshot::channel();
+                tx.send(Cmd::<Q, R>::Connect { peer, addrs, reply: rtx }).map_err(|_| stopped())?;
+                tokio::time::timeout(Duration::from_secs(30), rrx)
+                    .await
+                    .map_err(|_| NetError::Network(format!("cannot reach {peer} in time")))?
+                    .map_err(|_| stopped())??;
+                crate::stream::open(control, peer, p, limits).await
+            })
+        })
+    }
+
     /// [`Node::open_stream`] for async callers (any executor).
     pub async fn open_stream_async(&self, peer: PeerId, addrs: &[Multiaddr], protocol: &str, limits: Limits) -> Result<Stream> {
         let p = StreamProtocol::try_from_owned(protocol.to_string()).map_err(|e| NetError::Network(format!("bad protocol id {protocol}: {e}")))?;
@@ -801,6 +851,9 @@ impl<Q: Message, R: Message> Drop for Node<Q, R> {
         self.shutdown();
     }
 }
+
+/// Opens a stream of one protocol to a peer, connecting first (held by services like the ingress).
+pub(crate) type Opener = Arc<dyn Fn(PeerId, Vec<Multiaddr>) -> futures::future::BoxFuture<'static, Result<Stream>> + Send + Sync>;
 
 /// A DHT lookup collecting entries, and who waits for them.
 type Gathering = (Vec<Entry>, oneshot::Sender<Result<Vec<Entry>>>);

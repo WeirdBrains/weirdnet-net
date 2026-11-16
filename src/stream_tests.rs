@@ -282,3 +282,22 @@ fn live_relay_stream_moves_to_direct() {
     eprintln!("4 MiB echoed in {:?}, moves {}, path {:?}", t.elapsed(), s.moves(), s.path());
     assert!(got == data);
 }
+
+#[test]
+fn dropping_a_stream_ends_it_without_losing_what_was_written() {
+    let b = start(mem(true));
+    let mut inc = b.accept_streams(P, Limits::default()).unwrap();
+    let a = start(mem(false));
+    let data = pattern(2 * 1024 * 1024);
+    let mut s = a.open_stream(b.peer_id(), &[mem_addr(&b)], P, Limits::default()).unwrap();
+    let d2 = data.clone();
+    let w = std::thread::spawn(move || {
+        s.write_all(&d2).unwrap();
+        drop(s); // no close_write, no waiting
+    });
+    let mut t = inc.accept_timeout(Duration::from_secs(10)).unwrap();
+    let mut got = vec![];
+    t.read_to_end(&mut got).unwrap();
+    w.join().unwrap();
+    assert!(got == data);
+}

@@ -17,11 +17,13 @@ All notable changes to weirdnet-net are listed here. The format follows
 - Async request, connect and dial.
 - CI builds for Android and iOS and tests on macOS and Windows.
 - WebSocket over TLS: dial `/tls/ws` and `/wss` addresses, and listen on them with a certificate.
+- SNI-passthrough ingress: signed grants, DNS-bound names, PROXY v2 headers, HTTP-01 on port 80, per-site revocation.
 
 ### Fixed
 
 - A request or dial through a relay no longer fails while the node is still connecting to that relay.
 - A relay reservation that is lost is asked for again.
+- Dropping a stream ends it after what was written instead of resetting it.
 
 ## [0.2.0] - 2026-11-16
 

@@ -544,7 +544,8 @@ struct Driver {
     ack_sent: u64,
     peer_fin: Option<u64>,
     app_out: Option<mpsc::Sender<Chunk>>,
-    reset_rx: mpsc::UnboundedReceiver<()>,
+    /// `None` once the application dropped its end (an end, not a reset).
+    reset_rx: Option<mpsc::UnboundedReceiver<()>>,
     last: Instant,
 }
 
@@ -604,7 +605,7 @@ impl Driver {
             ack_sent: 0,
             peer_fin: None,
             app_out: Some(ends.app_out),
-            reset_rx: ends.reset_rx,
+            reset_rx: Some(ends.reset_rx),
             last: Instant::now(),
         }
     }
@@ -767,7 +768,14 @@ impl Driver {
         tokio::select! {
             // a reset comes before the end that dropping the stream also makes
             biased;
-            _ = self.reset_rx.next() => Step::Fail("reset".into()),
+            r = async { self.reset_rx.as_mut().unwrap().next().await }, if self.reset_rx.is_some() => match r {
+                Some(()) => Step::Fail("reset".into()),
+                // dropped: what was written still goes out, then the end
+                None => {
+                    self.reset_rx = None;
+                    Step::Go
+                }
+            },
             f = self.frames.next() => match f {
                 Some((g, f)) => self.frame(g, f),
                 None => Step::Go,

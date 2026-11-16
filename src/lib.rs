@@ -4,6 +4,7 @@ mod error;
 pub mod events;
 pub mod exchange;
 pub mod identity;
+pub mod ingress;
 pub mod invite;
 pub mod names;
 pub mod node;
@@ -38,6 +39,8 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod events_tests;
+#[cfg(test)]
+mod ingress_tests;
 #[cfg(test)]
 mod names_tests;
 #[cfg(test)]

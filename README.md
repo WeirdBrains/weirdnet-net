@@ -41,6 +41,17 @@ response types, its own storage and its own policy; the crate brings the wire.
   `NodeConfig::wss` set to a `WssTls` (`from_pem_files("fullchain.pem", "privkey.pem")`) a node
   also listens on `/ip4/0.0.0.0/tcp/443/tls/ws`. Noise and Yamux run inside, so peer ids are
   checked as on TCP. A renewed certificate takes a restart for now.
+- `ingress`: public HTTPS for hosts without a public address, by SNI passthrough. An
+  ingress peer (`Ingress::start(&node, IngressConfig { https: 0.0.0.0:443, http: 0.0.0.0:80, .. },
+  binding)`) reads only the ClientHello's server name, finds the host that registered it and
+  splices the bytes over a `/weirdnet/ingress/1` stream behind a PROXY v2 header (client
+  address, name). TLS ends on the host (`Node::accept_ingress`); the ingress holds no key. A
+  host registers with `Node::register_ingress` and an `IngressGrant` signed by its user key;
+  the ingress checks the grant, the user's certificate for the node and the DNS binding
+  `_weirdnet.<name> TXT "v=1 user=<id>"` (`DnsBinding`). Port 80 forwards ACME HTTP-01 for
+  registered names and redirects the rest to HTTPS. `Ingress::revoke(name)` stops a site on
+  this device and `set_enabled(false)` stops forwarding altogether. No HTTP/3 passthrough
+  and no per-grant byte limits yet.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
