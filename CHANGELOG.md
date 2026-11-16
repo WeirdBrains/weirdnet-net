@@ -20,6 +20,9 @@ All notable changes to weirdnet-net are listed here. The format follows
 - SNI-passthrough ingress: signed grants, DNS-bound names, PROXY v2 headers, HTTP-01 on port 80, per-site revocation.
 - Ingress names served on the device itself go to a local listener, so a relay's own WSS shares port 443.
 - dnsaddr_record, dnsaddr_txt and dnsaddr_dial for `/dnsaddr` names, and a DNS servers setting.
+- Content: content-defined chunks, BLAKE3 roots, signed manifests and chunk stores.
+- Fetch files from one or more peers, by delta, by byte range, resuming after interruption.
+- Node::provide, Node::stop_providing and Node::providers for content in the DHT.
 
 ### Fixed
 

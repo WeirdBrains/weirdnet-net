@@ -261,3 +261,30 @@ fn a_node_can_bootstrap_from_and_reserve_on_the_same_relay() {
     let b = Node::<Hello, Hello>::start(&WEIRDNET, Keypair::generate_ed25519(), cfg, Arc::new(Greeter)).unwrap();
     wait("reservation", || b.status().reservations.contains(&r.peer_id().to_string()));
 }
+
+#[test]
+fn content_providers_are_found_in_the_dht() {
+    let (r, raddr) = relay();
+    let boot = || NodeConfig { bootstrap: vec![raddr.clone()], ..mem(false) };
+    let b =
+        Node::start(&WEIRDNET, Keypair::generate_ed25519(), NodeConfig { listen: vec!["/memory/0".parse().unwrap()], ..boot() }, Arc::new(Greeter))
+            .unwrap();
+    let c = Node::start(&WEIRDNET, Keypair::generate_ed25519(), boot(), Arc::new(Greeter)).unwrap();
+    wait("bootstrap", || b.status().connected.contains(&r.peer_id().to_string()) && c.status().connected.contains(&r.peer_id().to_string()));
+    use crate::content::{self, ChunkStore, MemoryStore};
+    let store: Arc<dyn ChunkStore> = Arc::new(MemoryStore::default());
+    let root = content::add_bytes(&*store, b"a public file").unwrap().root();
+    let _srv = content::serve(&b, store, Arc::new(|_, _| true)).unwrap();
+    let key = content::provider_key(&root);
+    let mut found = vec![];
+    wait("provider", || {
+        let _ = b.provide(&key);
+        found = c.providers(&key).unwrap_or_default();
+        found.contains(&b.peer_id())
+    });
+    assert!(!found.contains(&c.peer_id()));
+    assert!(c.providers(&content::provider_key(&[6u8; 32])).unwrap().is_empty());
+    // a provider found by key alone is reachable by key alone
+    let (_, st) = content::fetch(&c, &[found[0].into()], &root, Arc::new(MemoryStore::default())).unwrap();
+    assert_eq!(st.chunks, 2);
+}

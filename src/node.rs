@@ -289,8 +289,13 @@ enum Cmd<Q, R> {
     NetworkChanged { reply: oneshot::Sender<Result<()>> },
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
+    Provide { key: Vec<u8>, reply: oneshot::Sender<Result<()>> },
+    StopProviding { key: Vec<u8> },
+    Providers { key: Vec<u8>, reply: oneshot::Sender<Result<Vec<PeerId>>> },
     Stop,
 }
+
+type Providing = (Vec<PeerId>, oneshot::Sender<Result<Vec<PeerId>>>);
 
 /// A running node.
 pub struct Node<Q: Message, R: Message> {
@@ -588,6 +593,24 @@ impl<Q: Message, R: Message> Node<Q, R> {
     /// Where a peer is, by its key alone: what the DHT knows of it.
     pub fn find_peer(&self, peer: PeerId) -> Result<Vec<Multiaddr>> {
         self.call(|reply| Cmd::FindPeer { peer, reply }, Duration::from_secs(40))
+    }
+
+    /// Announce in the DHT that this node provides `key` (see
+    /// [`content::provider_key`](crate::content::provider_key)); kept and re-announced until
+    /// [`stop_providing`](Self::stop_providing) or the node stops.
+    pub fn provide(&self, key: &[u8]) -> Result<()> {
+        let key = key.to_vec();
+        self.call(|reply| Cmd::Provide { key, reply }, Duration::from_secs(5))
+    }
+
+    pub fn stop_providing(&self, key: &[u8]) -> Result<()> {
+        self.tx.send(Cmd::StopProviding { key: key.to_vec() }).map_err(|_| stopped())
+    }
+
+    /// The peers the DHT knows to provide `key` (this node excluded).
+    pub fn providers(&self, key: &[u8]) -> Result<Vec<PeerId>> {
+        let key = key.to_vec();
+        self.call(|reply| Cmd::Providers { key, reply }, Duration::from_secs(40))
     }
 
     /// Names servers to ask: the configured ones and the relays holding our reservation.
@@ -909,7 +932,10 @@ struct Loop<Q: Message, R: Message> {
     puts: HashMap<kad::QueryId, oneshot::Sender<Result<()>>>,
     gets: HashMap<kad::QueryId, Gathering>,
     finds: HashMap<kad::QueryId, Finding>,
+    provs: HashMap<kad::QueryId, Providing>,
     addr_book: HashMap<PeerId, Vec<Multiaddr>>,
+    /// What connected peers say they listen on (identify), for provider records without addresses.
+    heard: HashMap<PeerId, Vec<Multiaddr>>,
     /// Commands that go through a relay we are still connecting to (a bootstrap dial to the
     /// same relay under way makes libp2p's relay transport skip its own dial and fail).
     deferred: Vec<(PeerId, std::time::Instant, Cmd<Q, R>)>,
@@ -971,7 +997,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             puts: HashMap::new(),
             gets: HashMap::new(),
             finds: HashMap::new(),
+            provs: HashMap::new(),
             addr_book: HashMap::new(),
+            heard: HashMap::new(),
             deferred: vec![],
             conns: HashMap::new(),
             hub: Hub::default(),
@@ -1403,6 +1431,15 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             },
             Cmd::AddRelay { addr } => self.add_relay(addr),
+            Cmd::Provide { key, reply } => {
+                let r = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&key)).map(|_| ()).map_err(net_err);
+                let _ = reply.send(r);
+            }
+            Cmd::StopProviding { key } => self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(&key)),
+            Cmd::Providers { key, reply } => {
+                let q = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&key));
+                self.provs.insert(q, (vec![], reply));
+            }
             Cmd::Stop => {}
         }
     }
@@ -1478,6 +1515,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             SwarmEvent::ConnectionClosed { connection_id, peer_id, num_established, .. } => {
                 if let Some((_, relayed)) = self.conns.remove(&connection_id) {
                     self.hub.send(Event::Disconnected { peer: peer_id, path: path_of(relayed), remaining: num_established });
+                }
+                if num_established == 0 {
+                    self.heard.remove(&peer_id);
                 }
                 self.refresh()
             }
@@ -1557,8 +1597,14 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             BehaviourEvent::Kad(kad::Event::InboundRequest { request }) => match request {
                 kad::InboundRequest::PutRecord { record: Some(rec), source, .. } => self.inbound_put(rec, source),
                 kad::InboundRequest::AddProvider { record: Some(rec) } => {
-                    // the only provider key nodes announce is the relay key
-                    if rec.key.as_ref() == self.profile.relay_key.as_bytes() {
+                    // nodes announce the relay key and content roots, nothing else
+                    if rec.key.as_ref() == self.profile.relay_key.as_bytes() || crate::content::is_provider_key(rec.key.as_ref()) {
+                        let mut rec = rec;
+                        // a provider that sent no addresses is answered with the ones we know,
+                        // or others could not reach it
+                        if rec.addresses.is_empty() {
+                            rec.addresses = self.heard.get(&rec.provider).or_else(|| self.addr_book.get(&rec.provider)).cloned().unwrap_or_default();
+                        }
                         let _ = self.swarm.behaviour_mut().kad.store_mut().add_provider(rec);
                     }
                 }
@@ -1635,6 +1681,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 let is_relay = caps.iter().any(|c| c == "relay");
                 let addrs: Vec<String> = info.listen_addrs.iter().filter(|a| shareable(a)).map(|a| a.to_string()).collect();
+                self.heard.insert(peer_id, info.listen_addrs.iter().filter(|a| shareable(a)).take(8).cloned().collect());
                 self.seen(Sighting { peer: peer_id, addrs, caps: Some(caps), agent: Some(info.agent_version), source: "identify" });
                 // behind NAT: use relays we meet
                 let private = self.status.lock().map(|s| s.nat == "private").unwrap_or(false);
@@ -1645,6 +1692,24 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     && let Some(a) = info.listen_addrs.iter().filter(|a| shareable(a)).min_by_key(|a| reach_rank(a))
                 {
                     self.add_relay(a.clone().with(Protocol::P2p(peer_id)));
+                }
+            }
+            BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(r), step, .. })
+                if self.provs.contains_key(&id) =>
+            {
+                let me = *self.swarm.local_peer_id();
+                let done = step.last || !matches!(r, Ok(kad::GetProvidersOk::FoundProviders { .. }));
+                if let Some((found, _)) = self.provs.get_mut(&id)
+                    && let Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) = r
+                {
+                    for p in providers {
+                        if p != me && !found.contains(&p) {
+                            found.push(p);
+                        }
+                    }
+                }
+                if done && let Some((found, reply)) = self.provs.remove(&id) {
+                    let _ = reply.send(Ok(found));
                 }
             }
             BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {

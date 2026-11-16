@@ -3946,6 +3946,7 @@ name = "weirdnet-net"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "blake3",
  "futures",
  "hex",
  "hickory-resolver",

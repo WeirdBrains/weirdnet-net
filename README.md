@@ -56,6 +56,17 @@ response types, its own storage and its own policy; the crate brings the wire.
   (`dnsaddr=/dns/<name>/tcp/<port>/p2p/<peer>`) for Grindvakt or any DNS provider to write, and
   `dnsaddr_dial(name, peer)` to reach the node by it. `NodeConfig::dns_servers` picks the
   resolver; without it the system's is used, or public resolvers where there is none (Android).
+- `content`: files by content. `add_reader`/`add_bytes` split a file into content-defined
+  chunks (an rsync-style rolling checksum, 16 to 256 KiB) in the application's `ChunkStore`
+  (`MemoryStore`, `DirStore` or its own) and return a `FileIndex`; the file's root is the
+  BLAKE3 hash of that index, and an edit changes only the chunks around it. A `Manifest` maps
+  paths to roots, sizes and app metadata, versioned and signed by a user key, with roots it
+  revokes. `serve(&node, store, allow)` answers `/weirdnet/content/1` for what `allow` lets
+  each peer have; `fetch` (or `fetch_async`) gets a root's index and the chunks the store
+  lacks from one or more `Source`s, checking every hash, so a newer version moves only its
+  changed chunks and an interrupted fetch picks up where it stopped. `fetch_range` gets only
+  the chunks under a byte range and `read_range` reads it. Public content goes in the DHT
+  with `Node::provide(&provider_key(&root))` and is found with `Node::providers`.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
