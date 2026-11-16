@@ -26,6 +26,7 @@ All notable changes to weirdnet-net are listed here. The format follows
 - Memberships with roles, signed by the resource owner, and their revocations.
 - Presenting a membership on a stream, checked against the sending node.
 - Requests to join: signed requests, approvals and denials, rate limits and a host queue.
+- A multi-host network harness in CI: NAT hole punching, relays, QUIC, mDNS and AutoNAT.
 
 ### Fixed
 

@@ -105,6 +105,12 @@ response types, its own storage and its own policy; the crate brings the wire.
   user certificates, revocations, cards and link grants, the linked-node sync key, dark-shard
   blobs as custodians carry them, and address helpers.
 
+`harness/netns.sh` runs nodes in Linux network namespaces behind iptables NAT routers
+(`examples/netns_node.rs`), and CI runs it: reservations on a relay, a stream that starts
+on the relay and moves to a hole-punched direct path across two NATs, a symmetric NAT that
+stays on the relay, QUIC to the relay, mDNS on a LAN, and AutoNAT verdicts, each with a
+content fetch. Run it with `sudo harness/netns.sh target/debug/examples/netns_node`.
+
 Every identifier on the wire or under a signature comes from a `Profile`. `WEIRDNET` is the
 default (`/weirdnet/net/1`, `wnet-x1-offer:`, `weirdnet://join/`, port 4747 and so on). An
 application with nodes already in the field passes its own profile with the values those

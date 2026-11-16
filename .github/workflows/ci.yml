@@ -52,3 +52,15 @@ jobs:
         with:
           targets: aarch64-apple-ios
       - run: cargo check --locked --target aarch64-apple-ios
+
+  # W4: real TCP, QUIC, relays, NAT hole punching, mDNS and AutoNAT between network
+  # namespaces behind iptables NAT routers (harness/netns.sh).
+  netns:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --example netns_node
+      - run: sudo env OUT=/tmp/wn-harness harness/netns.sh target/debug/examples/netns_node
+      - if: failure()
+        run: sudo tail -n +1 /tmp/wn-harness/*.log | tail -n 400
