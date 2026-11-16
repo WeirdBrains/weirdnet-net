@@ -7,6 +7,8 @@ pub mod exchange;
 pub mod identity;
 pub mod ingress;
 pub mod invite;
+pub mod join;
+pub mod member;
 pub mod names;
 pub mod node;
 pub mod profile;
@@ -46,6 +48,8 @@ mod dnsaddr_tests;
 mod events_tests;
 #[cfg(test)]
 mod ingress_tests;
+#[cfg(test)]
+mod member_tests;
 #[cfg(test)]
 mod names_tests;
 #[cfg(test)]

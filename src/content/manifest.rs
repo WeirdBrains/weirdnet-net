@@ -2,6 +2,7 @@
 //! file roots, sizes and the app's own metadata, and roots no longer to be served.
 use super::{Hash, hex, unhex};
 use crate::error::{NetError, Result};
+use crate::member::MemberRevocation;
 use crate::user::{decode_public, user_id};
 use libp2p::identity::Keypair;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,17 @@ pub struct ManifestEntry {
     pub meta: Vec<u8>,
 }
 
+/// What goes into a [`Manifest`] before it is signed.
+#[derive(Debug, Clone, Default)]
+pub struct ManifestDraft {
+    pub id: String,
+    pub version: u64,
+    pub entries: Vec<ManifestEntry>,
+    /// Roots (hex) no longer to be served.
+    pub revoked: Vec<String>,
+    pub member_revocations: Vec<MemberRevocation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub v: u8,
@@ -33,6 +45,9 @@ pub struct Manifest {
     pub entries: Vec<ManifestEntry>,
     /// Roots that must no longer be served or fetched under this id.
     pub revoked: Vec<String>,
+    /// The owner's membership revocations for this resource (W3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_revocations: Vec<MemberRevocation>,
     pub issued_at: i64,
     pub sig: Vec<u8>,
 }
@@ -67,16 +82,18 @@ impl Manifest {
     }
 
     /// Sign a manifest with the user key.
-    pub fn sign(user: &Keypair, id: &str, version: u64, mut entries: Vec<ManifestEntry>, revoked: Vec<String>, now: i64) -> Result<Manifest> {
+    pub fn sign(user: &Keypair, draft: ManifestDraft, now: i64) -> Result<Manifest> {
+        let ManifestDraft { id, version, mut entries, revoked, member_revocations } = draft;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         let mut m = Manifest {
             v: 1,
-            id: id.to_string(),
+            id,
             version,
             user_id: user_id(&user.public()),
             user_key: user.public().encode_protobuf(),
             entries,
             revoked,
+            member_revocations,
             issued_at: now,
             sig: vec![],
         };
@@ -105,6 +122,12 @@ impl Manifest {
             if unhex(&e.root).is_none_or(|r| r.len() != 32) {
                 return Err(bad(format!("`{}`: bad root", e.path)));
             }
+        }
+        for r in &self.member_revocations {
+            if r.issuer_id != self.user_id {
+                return Err(bad("a member revocation is not the owner's".into()));
+            }
+            r.verify()?;
         }
         if self.revoked.iter().any(|r| unhex(r).is_none_or(|r| r.len() != 32)) {
             return Err(bad("bad revoked root".into()));

@@ -23,6 +23,9 @@ All notable changes to weirdnet-net are listed here. The format follows
 - Content: content-defined chunks, BLAKE3 roots, signed manifests and chunk stores.
 - Fetch files from one or more peers, by delta, by byte range, resuming after interruption.
 - Node::provide, Node::stop_providing and Node::providers for content in the DHT.
+- Memberships with roles, signed by the resource owner, and their revocations.
+- Presenting a membership on a stream, checked against the sending node.
+- Requests to join: signed requests, approvals and denials, rate limits and a host queue.
 
 ### Fixed
 

@@ -1,6 +1,6 @@
 //! Content: chunking that survives edits, indexes, manifests, and fetching over the
 //! in-memory transport from one and several peers, by delta, by range and after interruption.
-use crate::content::{self, ChunkStore, DirStore, FileIndex, Manifest, ManifestEntry, MemoryStore, Source};
+use crate::content::{self, ChunkStore, DirStore, FileIndex, Manifest, ManifestDraft, ManifestEntry, MemoryStore, Source};
 use crate::node::{Handler, Node, NodeConfig};
 use crate::{Keypair, Multiaddr, PeerId, WEIRDNET};
 use serde::{Deserialize, Serialize};
@@ -113,8 +113,9 @@ fn manifests_are_signed_and_checked() {
     let s = MemoryStore::default();
     let r = content::add_bytes(&s, b"<h1>hi</h1>").unwrap().root_hex();
     let e = |p: &str| ManifestEntry { path: p.into(), root: r.clone(), size: 11, meta: b"text/html".to_vec() };
+    let d = |version, entries, revoked| ManifestDraft { id: "site".into(), version, entries, revoked, ..Default::default() };
     let now = crate::now_ms();
-    let m = Manifest::sign(&user, "site", 2, vec![e("index.html"), e("a/b.html")], vec![], now).unwrap();
+    let m = Manifest::sign(&user, d(2, vec![e("index.html"), e("a/b.html")], vec![]), now).unwrap();
     m.verify(now).unwrap();
     assert_eq!(m.entries[0].path, "a/b.html");
     assert_eq!(m.entry("index.html").unwrap().meta, b"text/html");
@@ -128,11 +129,11 @@ fn manifests_are_signed_and_checked() {
     t.user_key = Keypair::generate_ed25519().public().encode_protobuf();
     assert!(t.verify(now).is_err(), "someone else's key");
     for bad in ["../x", "/etc", "a//b", "", "a/./b"] {
-        assert!(Manifest::sign(&user, "site", 1, vec![e(bad)], vec![], now).is_err(), "{bad}");
+        assert!(Manifest::sign(&user, d(1, vec![e(bad)], vec![]), now).is_err(), "{bad}");
     }
-    assert!(Manifest::sign(&user, "site", 1, vec![e("x"), e("x")], vec![], now).is_err(), "repeated path");
+    assert!(Manifest::sign(&user, d(1, vec![e("x"), e("x")], vec![]), now).is_err(), "repeated path");
 
-    let newer = Manifest::sign(&user, "site", 3, vec![e("index.html")], vec![r.clone()], now).unwrap();
+    let newer = Manifest::sign(&user, d(3, vec![e("index.html")], vec![r.clone()]), now).unwrap();
     assert!(newer.supersedes(&m) && !m.supersedes(&newer));
     assert!(newer.is_revoked(&content::parse_hash(&r).unwrap()));
 }

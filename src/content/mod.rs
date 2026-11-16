@@ -21,7 +21,7 @@ mod store;
 
 pub use chunk::{MAX_CHUNK, MIN_CHUNK};
 pub use index::FileIndex;
-pub use manifest::{Manifest, ManifestEntry};
+pub use manifest::{Manifest, ManifestDraft, ManifestEntry};
 pub use store::{ChunkStore, DirStore, MemoryStore};
 
 use crate::error::{NetError, Result};
