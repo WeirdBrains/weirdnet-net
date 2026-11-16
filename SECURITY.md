@@ -47,9 +47,8 @@ a request answered through a relay circuit under the default and unlimited limit
 QUIC sockets, hole punching, mDNS and AutoNAT are not exercised by the tests.
 
 Relay limits: `RelayLimits::unlimited()` removes every reservation, circuit, time and byte
-cap, so a relay running it carries whatever its clients send (libp2p's per-peer and
-per-IP reservation and circuit rate limiters still apply). Bandwidth controls are the
-operator's.
+cap and libp2p's rate limiters, so a relay running it carries whatever its clients send.
+Bandwidth and abuse controls are the operator's.
 
 Not verified: an audit, fuzzing, Windows, macOS, iOS and Android, an MSRV run and minimal
 dependency versions. Requests up to 8 MiB and answers up to 256 MiB are accepted, with a
