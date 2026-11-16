@@ -28,3 +28,6 @@ break the 0.1 API.
 
 - First release, extracted from Muninn: the Weirdnet libp2p node with identities, Kademlia,
   relays, hole punching and request-response protocols.
+
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/WeirdBrains/weirdnet-net/releases/tag/v0.2.0

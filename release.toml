@@ -20,6 +20,7 @@ path = "Cargo.lock"
 
 [changelog]
 path = "CHANGELOG.md"
+links = "https://github.com/WeirdBrains/weirdnet-net"
 default_section = "Added"
 
 [checks]
