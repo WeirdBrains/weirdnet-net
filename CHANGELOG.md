@@ -7,6 +7,8 @@ break the 0.1 API.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
 ### Added
 
 - Relay limits for nodes that relay, with an unlimited preset.
