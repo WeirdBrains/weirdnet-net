@@ -4,6 +4,7 @@ mod error;
 pub mod exchange;
 pub mod identity;
 pub mod invite;
+pub mod names;
 pub mod node;
 pub mod profile;
 pub mod sealed;
@@ -29,6 +30,8 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[cfg(test)]
+mod names_tests;
 #[cfg(test)]
 mod relay_tests;
 #[cfg(test)]

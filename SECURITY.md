@@ -46,6 +46,19 @@ Tested over libp2p's in-memory transport (real Noise, Yamux and request-response
 a request answered through a relay circuit under the default and unlimited limits; TCP and
 QUIC sockets, hole punching, mDNS and AutoNAT are not exercised by the tests.
 
+Names: a storing node (names server or DHT peer) keeps an entry only if it verifies (node
+signature, the user's unrevoked certificate for that node, ids matching the keys, an expiry
+within a day for records and one day to a week for withdrawals, every address ending in the
+node's peer id) and its `seq` is above the unexpired entry it holds. A names server takes a
+record or withdrawal only from the node that signed it. Kademlia runs with
+`StoreInserts::FilterBoth`: other values are refused, and only the relay key is accepted as
+a provider key. No DHT can force deletion: a hostile node can keep serving an old record,
+which lookups drop once expired or outranked, and a stale record leads to a failed dial,
+not a wrong peer (dials are Noise-authenticated to the record's peer id). Records reveal
+the user id and addresses to anyone who looks them up; private, blinded locator records are
+not implemented yet. There is no cap on how many entries a names server holds; entries
+expire and are pruned every minute.
+
 Relay limits: `RelayLimits::unlimited()` removes every reservation, circuit, time and byte
 cap and libp2p's rate limiters, so a relay running it carries whatever its clients send.
 Bandwidth and abuse controls are the operator's.

@@ -9,13 +9,14 @@
 //! that come in are answered by a [`Handler`] on Tokio's blocking pool.
 use crate::addr::{addr_peer, reach_rank, routable, shareable};
 use crate::error::{NetError, Result};
+use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
 use crate::profile::Profile;
 use futures::StreamExt;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{Boxed, MemoryTransport, Transport};
 use libp2p::core::upgrade::Version;
 use libp2p::identity::Keypair;
-use libp2p::kad::{self, store::MemoryStore};
+use libp2p::kad::{self, store::MemoryStore, store::RecordStore};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -57,6 +58,11 @@ pub struct NodeConfig {
     pub version: String,
     /// What the relay server (`relay_server`) allows; the default is libp2p's.
     pub relay_limits: RelayLimits,
+    /// Serve the names protocol (rendezvous for signed peer records) from this store.
+    pub names_server: Option<Names>,
+    /// Names servers to register with and look users up on (`…/p2p/ID`), besides the
+    /// relays this node holds a reservation on.
+    pub names_servers: Vec<Multiaddr>,
 }
 
 /// Limits of the relay server: how many reservations and circuits it holds, and how long
@@ -218,6 +224,7 @@ mod wire {
     #[derive(NetworkBehaviour)]
     pub(super) struct Behaviour<Q: Message, R: Message> {
         pub(super) rr: request_response::cbor::Behaviour<Q, R>,
+        pub(super) names: request_response::cbor::Behaviour<NamesRequest, NamesResponse>,
         pub(super) identify: identify::Behaviour,
         pub(super) ping: ping::Behaviour,
         pub(super) kad: kad::Behaviour<MemoryStore>,
@@ -232,6 +239,11 @@ use wire::{Behaviour, BehaviourEvent};
 
 enum Cmd<Q, R> {
     Request { peer: PeerId, addrs: Vec<Multiaddr>, wire: Q, reply: oneshot::Sender<Result<R>> },
+    Names { peer: PeerId, addrs: Vec<Multiaddr>, req: NamesRequest, reply: oneshot::Sender<Result<NamesResponse>> },
+    PutEntry { entry: Entry, reply: oneshot::Sender<Result<()>> },
+    GetEntries { user: String, reply: oneshot::Sender<Result<Vec<Entry>>> },
+    FindPeer { peer: PeerId, reply: oneshot::Sender<Result<Vec<Multiaddr>>> },
+    KnownAddrs { reply: oneshot::Sender<Result<Vec<(PeerId, Multiaddr)>>> },
     Dial { addr: Multiaddr, reply: oneshot::Sender<Result<PeerId>> },
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
@@ -241,6 +253,8 @@ enum Cmd<Q, R> {
 /// A running node.
 pub struct Node<Q: Message, R: Message> {
     peer_id: PeerId,
+    profile: &'static Profile,
+    names_list: Vec<Multiaddr>,
     tx: mpsc::UnboundedSender<Cmd<Q, R>>,
     status: Arc<Mutex<Status>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -275,12 +289,20 @@ fn behaviour<Q: Message, R: Message>(
         identify::Behaviour::new(identify::Config::new(p.identify.into(), key.public()).with_agent_version(agent).with_hide_listen_addrs(hide));
     let mut kcfg = kad::Config::new(StreamProtocol::new(p.kad));
     kcfg.set_query_timeout(Duration::from_secs(30));
+    // every record and provider a peer puts is checked first (peer records, relay keys)
+    kcfg.set_record_filtering(kad::StoreInserts::FilterBoth);
+    let names = request_response::cbor::Behaviour::with_codec(
+        request_response::cbor::codec::Codec::default().set_request_size_maximum(64 * 1024).set_response_size_maximum(64 * 1024),
+        [(StreamProtocol::new(p.names), if cfg.names_server.is_some() { ProtocolSupport::Full } else { ProtocolSupport::Outbound })],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
+    );
     let kad = kad::Behaviour::with_config(peer, MemoryStore::new(peer), kcfg);
     let mdns = if cfg.mdns && !cfg.memory { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer).map_err(net_err)?) } else { None };
     let relay_server = cfg.relay_server.then(|| relay::Behaviour::new(peer, cfg.relay_limits.config()));
     let autonat = autonat::Behaviour::new(peer, autonat::Config { only_global_ips: !cfg.memory, ..Default::default() });
     Ok(Behaviour {
         rr,
+        names,
         identify,
         ping: ping::Behaviour::new(ping::Config::new()),
         kad,
@@ -354,6 +376,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let st = status.clone();
+        let names_list = cfg.names_servers.clone();
         let thread = std::thread::Builder::new()
             .name(profile.thread.into())
             .spawn(move || {
@@ -389,7 +412,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
             })
             .map_err(net_err)?;
         match ready_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(())) => Ok(Node { peer_id, tx, status, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(Node { peer_id, profile, names_list, tx, status, thread: Some(thread) }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -451,6 +474,120 @@ impl<Q: Message, R: Message> Node<Q, R> {
         self.call(|reply| Cmd::Request { peer, addrs, wire, reply }, REQUEST_TIMEOUT + Duration::from_secs(5))
     }
 
+    /// Ask a names server (a relay, usually) something; `addrs` are tried if not connected.
+    pub fn names_request(&self, server: PeerId, addrs: &[Multiaddr], req: NamesRequest) -> Result<NamesResponse> {
+        let addrs = addrs.to_vec();
+        self.call(|reply| Cmd::Names { peer: server, addrs, req, reply }, Duration::from_secs(30))
+    }
+
+    /// Register a record or withdrawal on a names server.
+    pub fn register(&self, server: PeerId, addrs: &[Multiaddr], entry: Entry) -> Result<()> {
+        match self.names_request(server, addrs, NamesRequest::Register(Box::new(entry)))? {
+            NamesResponse::Registered => Ok(()),
+            NamesResponse::Refused(why) => Err(NetError::Network(format!("the names server refused: {why}"))),
+            NamesResponse::Found(_) => Err(NetError::Network("unexpected answer from the names server".into())),
+        }
+    }
+
+    /// A user's entry on one names server.
+    pub fn discover(&self, server: PeerId, addrs: &[Multiaddr], user: &str) -> Result<Option<Entry>> {
+        match self.names_request(server, addrs, NamesRequest::Discover { user_id: user.into() })? {
+            NamesResponse::Found(e) => Ok(e.map(|e| *e)),
+            NamesResponse::Refused(why) => Err(NetError::Network(format!("the names server refused: {why}"))),
+            NamesResponse::Registered => Err(NetError::Network("unexpected answer from the names server".into())),
+        }
+    }
+
+    /// Put a record or withdrawal in the DHT (checked first, like every storing node does).
+    /// Records belong in the DHT only while the device hosts something public or private.
+    pub fn put_entry(&self, entry: Entry) -> Result<()> {
+        self.call(|reply| Cmd::PutEntry { entry, reply }, Duration::from_secs(40))
+    }
+
+    /// Every entry the DHT returns for a user (unchecked; see [`Profile::newest`]).
+    pub fn get_entries(&self, user: &str) -> Result<Vec<Entry>> {
+        let user = user.to_string();
+        self.call(|reply| Cmd::GetEntries { user, reply }, Duration::from_secs(40))
+    }
+
+    /// Where a peer is, by its key alone: what the DHT knows of it.
+    pub fn find_peer(&self, peer: PeerId) -> Result<Vec<Multiaddr>> {
+        self.call(|reply| Cmd::FindPeer { peer, reply }, Duration::from_secs(40))
+    }
+
+    /// Names servers to ask: the configured ones and the relays holding our reservation.
+    fn names_servers(&self) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        let known = self.call(|reply| Cmd::KnownAddrs { reply }, Duration::from_secs(5)).unwrap_or_default();
+        let mut out: Vec<(PeerId, Vec<Multiaddr>)> = vec![];
+        let reserved: Vec<PeerId> = self.status().reservations.iter().filter_map(|r| r.parse().ok()).collect();
+        for (p, a) in known.into_iter() {
+            if reserved.contains(&p) || self.names_list.iter().any(|n| addr_peer(n) == Some(p)) {
+                match out.iter_mut().find(|(q, _)| *q == p) {
+                    Some((_, v)) => v.push(a),
+                    None => out.push((p, vec![a])),
+                }
+            }
+        }
+        for n in &self.names_list {
+            if let Some(p) = addr_peer(n)
+                && !out.iter().any(|(q, _)| *q == p)
+            {
+                out.push((p, vec![n.clone()]));
+            }
+        }
+        out
+    }
+
+    /// Register an entry with every names server this node uses (its relays and the
+    /// configured ones); returns how many took it.
+    pub fn register_everywhere(&self, entry: &Entry) -> usize {
+        self.names_servers().into_iter().filter(|(p, a)| self.register(*p, a, entry.clone()).is_ok()).count()
+    }
+
+    /// Find a user's freshest valid record: on this node's names servers, then in the DHT.
+    pub fn lookup(&self, user: &str) -> Lookup {
+        let mut found: Vec<Entry> = vec![];
+        for (p, a) in self.names_servers() {
+            if let Ok(Some(e)) = self.discover(p, &a, user) {
+                found.push(e);
+            }
+        }
+        if let Ok(v) = self.get_entries(user) {
+            found.extend(v);
+        }
+        self.profile.newest(user, &found, crate::now_ms())
+    }
+
+    /// Send a request to a peer known only by its key: when not connected, find its
+    /// addresses in the DHT and try circuits through this node's relays and names servers.
+    pub fn request_key(&self, peer: PeerId, wire: Q) -> Result<R> {
+        if self.status().connected.contains(&peer.to_string()) {
+            return self.request(peer, &[], wire);
+        }
+        let mut addrs = self.find_peer(peer).unwrap_or_default();
+        for (_, a) in self.names_servers() {
+            for base in a {
+                let base: Multiaddr = base.iter().take_while(|p| *p != Protocol::P2pCircuit).collect();
+                addrs.push(base.with(Protocol::P2pCircuit).with(Protocol::P2p(peer)));
+            }
+        }
+        self.request(peer, &addrs, wire)
+    }
+
+    /// Send a request to a user's node: look up its record and dial its addresses
+    /// (circuits and direct ones together). Returns the node that answered.
+    pub fn request_user(&self, user: &str, wire: Q) -> Result<(PeerId, R)> {
+        match self.lookup(user) {
+            Lookup::Found(r) => {
+                let peer: PeerId = r.cert.peer_id.parse().map_err(|_| NetError::invalid("peer record", "bad peer id"))?;
+                let addrs = crate::addr::parse_addrs(&r.addrs);
+                Ok((peer, self.request(peer, &addrs, wire)?))
+            }
+            Lookup::Withdrawn(_) => Err(NetError::Network(format!("{user} withdrew its record"))),
+            Lookup::NotFound => Err(NetError::Network(format!("no record for {user}"))),
+        }
+    }
+
     /// Connect to an address; returns the peer there.
     pub fn dial(&self, addr: Multiaddr) -> Result<PeerId> {
         self.call(|reply| Cmd::Dial { addr, reply }, Duration::from_secs(30))
@@ -494,6 +631,11 @@ impl<Q: Message, R: Message> Drop for Node<Q, R> {
     }
 }
 
+/// A DHT lookup collecting entries, and who waits for them.
+type Gathering = (Vec<Entry>, oneshot::Sender<Result<Vec<Entry>>>);
+/// A DHT search for one peer's addresses.
+type Finding = (PeerId, oneshot::Sender<Result<Vec<Multiaddr>>>);
+
 struct Loop<Q: Message, R: Message> {
     profile: &'static Profile,
     swarm: Swarm<Behaviour<Q, R>>,
@@ -505,8 +647,17 @@ struct Loop<Q: Message, R: Message> {
     listens: HashMap<libp2p::core::transport::ListenerId, oneshot::Sender<Result<Multiaddr>>>,
     relays: HashSet<PeerId>,
     relay_listening: HashSet<PeerId>,
+    /// Each relay's circuit listener and when it was asked for (to retry a stuck one).
+    relay_listeners: HashMap<PeerId, (Multiaddr, libp2p::core::transport::ListenerId, std::time::Instant)>,
     resp_tx: mpsc::UnboundedSender<(request_response::ResponseChannel<R>, R)>,
     resp_rx: mpsc::UnboundedReceiver<(request_response::ResponseChannel<R>, R)>,
+    names_pending: HashMap<OutboundRequestId, oneshot::Sender<Result<NamesResponse>>>,
+    names_tx: mpsc::UnboundedSender<(request_response::ResponseChannel<NamesResponse>, NamesResponse)>,
+    names_rx: mpsc::UnboundedReceiver<(request_response::ResponseChannel<NamesResponse>, NamesResponse)>,
+    puts: HashMap<kad::QueryId, oneshot::Sender<Result<()>>>,
+    gets: HashMap<kad::QueryId, Gathering>,
+    finds: HashMap<kad::QueryId, Finding>,
+    addr_book: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
 impl<Q: Message, R: Message> Loop<Q, R> {
@@ -518,6 +669,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         status: Arc<Mutex<Status>>,
     ) -> Self {
         let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let (names_tx, names_rx) = mpsc::unbounded_channel();
         Loop {
             profile,
             swarm,
@@ -529,8 +681,16 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             listens: HashMap::new(),
             relays: HashSet::new(),
             relay_listening: HashSet::new(),
+            relay_listeners: HashMap::new(),
             resp_tx,
             resp_rx,
+            names_pending: HashMap::new(),
+            names_tx,
+            names_rx,
+            puts: HashMap::new(),
+            gets: HashMap::new(),
+            finds: HashMap::new(),
+            addr_book: HashMap::new(),
         }
     }
 
@@ -572,14 +732,18 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             return;
         }
+        // relays first: a reservation dials its relay, and a second dial to the same peer
+        // already under way would make the relay client skip its own
+        for r in self.cfg.relays.clone() {
+            self.add_relay(r);
+        }
         for b in self.cfg.bootstrap.clone() {
             if let Some(p) = addr_peer(&b) {
                 self.swarm.behaviour_mut().kad.add_address(&p, b.clone());
-                let _ = self.swarm.dial(b);
+                if !self.relay_listening.contains(&p) {
+                    let _ = self.swarm.dial(b);
+                }
             }
-        }
-        for r in self.cfg.relays.clone() {
-            self.add_relay(r);
         }
         if self.cfg.relay_server {
             self.swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
@@ -592,6 +756,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         let ready_deadline = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(ready_deadline);
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let mut check = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -600,6 +765,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 },
                 Some((ch, resp)) = self.resp_rx.recv() => {
                     let _ = self.swarm.behaviour_mut().rr.send_response(ch, resp);
+                }
+                Some((ch, resp)) = self.names_rx.recv() => {
+                    let _ = self.swarm.behaviour_mut().names.send_response(ch, resp);
                 }
                 ev = self.swarm.select_next_some() => {
                     let new_listen = matches!(ev, SwarmEvent::NewListenAddr { .. });
@@ -617,14 +785,21 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                 }
                 _ = tick.tick() => self.periodic(),
+                _ = check.tick() => self.retry_stuck_reservations(),
             }
         }
         for (_, tx) in self.pending.drain() {
             let _ = tx.send(Err(NetError::Network("the node stopped".into())));
         }
+        for (_, tx) in self.names_pending.drain() {
+            let _ = tx.send(Err(NetError::Network("the node stopped".into())));
+        }
     }
 
     fn periodic(&mut self) {
+        if let Some(n) = &self.cfg.names_server {
+            n.0.prune(crate::now_ms());
+        }
         let k = &mut self.swarm.behaviour_mut().kad;
         // With an empty routing table there is no one to bootstrap from; asking
         // anyway only makes libp2p warn "No known peers" every tick.
@@ -650,9 +825,38 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         self.relays.insert(peer);
         self.swarm.add_peer_address(peer, addr.clone());
         let circuit = addr.with(Protocol::P2pCircuit);
-        if let Err(e) = self.swarm.listen_on(circuit.clone()) {
-            tracing::warn!("network: cannot listen through relay {circuit}: {e}");
-            self.relay_listening.remove(&peer);
+        match self.swarm.listen_on(circuit.clone()) {
+            Ok(id) => {
+                self.relay_listeners.insert(peer, (circuit, id, std::time::Instant::now()));
+            }
+            Err(e) => {
+                tracing::warn!("network: cannot listen through relay {circuit}: {e}");
+                self.relay_listening.remove(&peer);
+            }
+        }
+    }
+
+    /// A reservation asked for while another dial to the relay was under way is never sent
+    /// (libp2p's relay client skips its own dial then); once connected, ask again.
+    fn retry_stuck_reservations(&mut self) {
+        let reserved = self.status.lock().map(|s| s.reservations.clone()).unwrap_or_default();
+        let stuck: Vec<PeerId> = self
+            .relay_listeners
+            .iter()
+            .filter(|(p, (_, _, at))| at.elapsed() > Duration::from_secs(3) && !reserved.contains(&p.to_string()) && self.swarm.is_connected(p))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in stuck {
+            if let Some((circuit, id, _)) = self.relay_listeners.remove(&p) {
+                tracing::debug!("network: asking relay {p} for a reservation again");
+                self.swarm.remove_listener(id);
+                match self.swarm.listen_on(circuit.clone()) {
+                    Ok(id) => {
+                        self.relay_listeners.insert(p, (circuit, id, std::time::Instant::now()));
+                    }
+                    Err(e) => tracing::warn!("network: cannot listen through relay {circuit}: {e}"),
+                }
+            }
         }
     }
 
@@ -664,6 +868,42 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 let id = self.swarm.behaviour_mut().rr.send_request(&peer, wire);
                 self.pending.insert(id, reply);
+            }
+            Cmd::Names { peer, addrs, req, reply } => {
+                for a in addrs {
+                    self.swarm.add_peer_address(peer, a);
+                }
+                let id = self.swarm.behaviour_mut().names.send_request(&peer, req);
+                self.names_pending.insert(id, reply);
+            }
+            Cmd::PutEntry { entry, reply } => {
+                let key = kad::RecordKey::new(&self.profile.record_key(entry.user_id()));
+                let existing = self.swarm.behaviour_mut().kad.store_mut().get(&key).and_then(|r| Entry::decode(&r.value).ok());
+                if let Err(e) = self.profile.accept(existing.as_ref(), &entry, crate::now_ms()) {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                let rec = record_of(key, &entry);
+                match self.swarm.behaviour_mut().kad.put_record(rec, kad::Quorum::One) {
+                    Ok(q) => {
+                        self.puts.insert(q, reply);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(net_err(e)));
+                    }
+                }
+            }
+            Cmd::GetEntries { user, reply } => {
+                let q = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&self.profile.record_key(&user)));
+                self.gets.insert(q, (vec![], reply));
+            }
+            Cmd::FindPeer { peer, reply } => {
+                let q = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
+                self.finds.insert(q, (peer, reply));
+            }
+            Cmd::KnownAddrs { reply } => {
+                let v = self.addr_book.iter().flat_map(|(p, a)| a.iter().map(|a| (*p, a.clone()))).collect();
+                let _ = reply.send(Ok(v));
             }
             Cmd::Dial { addr, reply } => {
                 let peer = addr_peer(&addr);
@@ -716,6 +956,13 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             SwarmEvent::ExternalAddrExpired { .. } | SwarmEvent::ExpiredListenAddr { .. } => self.refresh(),
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 let addr = endpoint.get_remote_address().clone();
+                if endpoint.is_dialer() {
+                    let a = if addr_peer(&addr) == Some(peer_id) { addr.clone() } else { addr.clone().with(Protocol::P2p(peer_id)) };
+                    let book = self.addr_book.entry(peer_id).or_default();
+                    if !book.contains(&a) {
+                        book.push(a);
+                    }
+                }
                 let mut i = 0;
                 while i < self.dials.len() {
                     let (a, p, _) = &self.dials[i];
@@ -775,6 +1022,75 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             BehaviourEvent::Rr(request_response::Event::InboundFailure { peer, error, .. }) => {
                 tracing::debug!("network: inbound request from {peer} failed: {error}");
+            }
+            BehaviourEvent::Names(request_response::Event::Message { peer, message, .. }) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    let Some(store) = self.cfg.names_server.clone() else { return };
+                    let tx = self.names_tx.clone();
+                    let profile = self.profile;
+                    tokio::task::spawn_blocking(move || {
+                        let resp = crate::names::serve(profile, &*store.0, &peer, request, crate::now_ms());
+                        let _ = tx.send((channel, resp));
+                    });
+                }
+                request_response::Message::Response { request_id, response } => {
+                    if let Some(tx) = self.names_pending.remove(&request_id) {
+                        let _ = tx.send(Ok(response));
+                    }
+                }
+            },
+            BehaviourEvent::Names(request_response::Event::OutboundFailure { request_id, error, peer, .. }) => {
+                if let Some(tx) = self.names_pending.remove(&request_id) {
+                    let _ = tx.send(Err(NetError::Network(format!("names server {} could not be reached ({error})", crate::short_peer_id(&peer)))));
+                }
+            }
+            BehaviourEvent::Kad(kad::Event::InboundRequest { request }) => match request {
+                kad::InboundRequest::PutRecord { record: Some(rec), source, .. } => self.inbound_put(rec, source),
+                kad::InboundRequest::AddProvider { record: Some(rec) } => {
+                    // the only provider key nodes announce is the relay key
+                    if rec.key.as_ref() == self.profile.relay_key.as_bytes() {
+                        let _ = self.swarm.behaviour_mut().kad.store_mut().add_provider(rec);
+                    }
+                }
+                _ => {}
+            },
+            BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::PutRecord(r), .. }) => {
+                if let Some(tx) = self.puts.remove(&id) {
+                    let _ = tx.send(r.map(|_| ()).map_err(net_err));
+                }
+            }
+            BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetRecord(r), step, .. }) => {
+                let done = match r {
+                    Ok(kad::GetRecordOk::FoundRecord(pr)) => {
+                        if let Some((v, _)) = self.gets.get_mut(&id)
+                            && let Ok(e) = Entry::decode(&pr.record.value)
+                        {
+                            v.push(e);
+                        }
+                        step.last
+                    }
+                    _ => true,
+                };
+                if done && let Some((v, tx)) = self.gets.remove(&id) {
+                    let _ = tx.send(Ok(v));
+                    if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                        q.finish();
+                    }
+                }
+            }
+            BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetClosestPeers(r), .. }) => {
+                if let Some((peer, tx)) = self.finds.remove(&id) {
+                    let addrs = match r {
+                        Ok(ok) => ok.peers,
+                        Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
+                    }
+                    .into_iter()
+                    .filter(|i| i.peer_id == peer)
+                    .flat_map(|i| i.addrs)
+                    .map(|a| if addr_peer(&a) == Some(peer) { a } else { a.with(Protocol::P2p(peer)) })
+                    .collect();
+                    let _ = tx.send(Ok(addrs));
+                }
             }
             BehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
                 let mut by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
@@ -855,6 +1171,40 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 tracing::debug!("network: hole punch with {}: {}", e.remote_peer_id, if e.result.is_ok() { "direct" } else { "failed" });
             }
             _ => {}
+        }
+    }
+}
+
+/// A Kademlia record holding a names entry, expiring with it.
+fn record_of(key: kad::RecordKey, entry: &Entry) -> kad::Record {
+    let mut rec = kad::Record::new(key, entry.encode());
+    let left = (entry.expires() - crate::now_ms()).max(0) as u64;
+    rec.expires = Some(std::time::Instant::now() + Duration::from_millis(left));
+    rec
+}
+
+impl<Q: Message, R: Message> Loop<Q, R> {
+    /// A peer put a record: keep it only if it is a valid names entry under its own key
+    /// that supersedes what we hold (see [`Profile::accept`]).
+    fn inbound_put(&mut self, rec: kad::Record, source: PeerId) {
+        let Ok(entry) = Entry::decode(&rec.value) else {
+            tracing::debug!("network: refused a DHT record from {source}: not a names entry");
+            return;
+        };
+        let key = kad::RecordKey::new(&self.profile.record_key(entry.user_id()));
+        if rec.key != key {
+            tracing::debug!("network: refused a DHT record from {source}: wrong key");
+            return;
+        }
+        let store = self.swarm.behaviour_mut().kad.store_mut();
+        let existing = store.get(&key).and_then(|r| Entry::decode(&r.value).ok());
+        match self.profile.accept(existing.as_ref(), &entry, crate::now_ms()) {
+            Ok(()) => {
+                let mut r = record_of(key, &entry);
+                r.publisher = rec.publisher;
+                let _ = store.put(r);
+            }
+            Err(e) => tracing::debug!("network: refused a DHT record from {source}: {e}"),
         }
     }
 }

@@ -12,6 +12,19 @@ response types, its own storage and its own policy; the crate brings the wire.
   `NodeConfig::relay_limits` sets what the relay server allows: `RelayLimits::default()`
   keeps libp2p's (2-minute, 128 KiB circuits, enough for hole punching and small requests),
   `RelayLimits::unlimited()` caps nothing, so circuits carry data.
+  Key-only dialing: `request_key(peer, …)` finds a peer by its key alone (the DHT, then
+  circuits through this node's relays and names servers); `request_user(user_id, …)` looks
+  the user's record up and dials it.
+- `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
+  `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
+  the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
+  `seq`, removes it and holds until it expires. Records go to the home relay's names server
+  (`/weirdnet/names/1`: `Node::register`, `discover`, `lookup`; a node serves it with
+  `NodeConfig::names_server`) and, while the device hosts something, to the Kademlia DHT
+  under `SHA-256("weirdnet/peer/" + user id)` (`put_entry`, `get_entries`), where every
+  storing node runs `Profile::accept`: valid signature, unrevoked certificate, unexpired,
+  higher `seq` wins. `_weirdnet.<name> TXT "v=1 user=<id>"` binds a domain to a user
+  (`binding_txt`, `parse_binding`).
 - `exchange`: signed offers and answers (Ed25519 node keys, fresh X25519 keys), the derived
   exchange key, a ten-digit short code and a fingerprint to compare out of band, tokens and
   links (invitations), scopes with an expiry, and sealed messages bound to the exchange and

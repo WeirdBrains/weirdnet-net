@@ -46,6 +46,14 @@ pub struct Profile {
     /// HKDF info of the linked-node sync key and the associated-data label of sync pages.
     pub sync_key: &'static str,
     pub sync_aad: &'static str,
+    /// The names (rendezvous) protocol id: peers register and look up signed peer records
+    /// on a relay or other names server.
+    pub names: &'static str,
+    /// Signature domains of peer records and their withdrawals, and the prefix of the
+    /// Kademlia key a user's record is stored under (`SHA-256(PREFIX + user id)`).
+    pub peer_record: &'static str,
+    pub withdrawal: &'static str,
+    pub peer_key: &'static str,
     /// The port nodes listen on unless told otherwise (TCP and QUIC).
     pub default_port: u16,
     /// The name of the node's thread (its runtime's threads add `-rt`).
@@ -77,6 +85,10 @@ pub const WEIRDNET: Profile = Profile {
     revoke: "weirdnet-node-revoke/1",
     sync_key: "weirdnet/sync/v1/key",
     sync_aad: "weirdnet/sync/v1",
+    names: "/weirdnet/names/1",
+    peer_record: "weirdnet/peer-record/v1",
+    withdrawal: "weirdnet/withdrawal/v1",
+    peer_key: "weirdnet/peer/",
     default_port: 4747,
     thread: "weirdnet-net",
     scopes,
