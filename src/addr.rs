@@ -8,7 +8,6 @@ pub fn addr_peer(a: &Multiaddr) -> Option<PeerId> {
     a.iter().filter_map(|p| if let Protocol::P2p(id) = p { Some(id) } else { None }).last()
 }
 
-/// Parse addresses, skipping bad ones.
 /// The relay of a circuit address (`…/p2p/RELAY/p2p-circuit/…`): its peer id and address.
 pub fn circuit_relay(a: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     let mut relay = Multiaddr::empty();
@@ -25,6 +24,7 @@ pub fn circuit_relay(a: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     None
 }
 
+/// Parse addresses, skipping bad ones.
 pub fn parse_addrs<S: AsRef<str>>(v: &[S]) -> Vec<Multiaddr> {
     v.iter().filter_map(|s| s.as_ref().trim().parse().ok()).collect()
 }
@@ -141,4 +141,37 @@ pub fn link_local(a: &str) -> bool {
 /// Docker's default bridge networks (172.17/16, 172.18/16): unreachable from other hosts.
 pub fn docker_bridge(a: &str) -> bool {
     a.strip_prefix("/ip4/172.").is_some_and(|r| r.starts_with("17.") || r.starts_with("18."))
+}
+
+/// The name of a host's `dnsaddr` TXT record: `_dnsaddr.<name>`.
+pub fn dnsaddr_name(name: &str) -> String {
+    format!("_dnsaddr.{}", name.trim().trim_end_matches('.'))
+}
+
+/// The TXT value naming one address of a node, `dnsaddr=<addr>`: libp2p resolves
+/// `/dnsaddr/<name>` to every such value under `_dnsaddr.<name>`. The address has to end in
+/// the node's `/p2p/<id>`, and the value fits one TXT string (255 bytes).
+pub fn dnsaddr_txt(addr: &Multiaddr) -> crate::Result<String> {
+    if addr_peer(addr).is_none() {
+        return Err(crate::NetError::invalid("dnsaddr", "the address has no /p2p/ peer id"));
+    }
+    let v = format!("dnsaddr={addr}");
+    if v.len() > 255 {
+        return Err(crate::NetError::invalid("dnsaddr", "longer than one TXT string"));
+    }
+    Ok(v)
+}
+
+/// The `_dnsaddr` record of a node reachable over TCP at `name`:`port`: the record's name
+/// and its TXT value (`dnsaddr=/dns/<name>/tcp/<port>/p2p/<peer>`), for Grindvakt or any DNS
+/// provider to write. Dial it with [`dnsaddr_dial`].
+pub fn dnsaddr_record(name: &str, port: u16, peer: &PeerId) -> crate::Result<(String, String)> {
+    let host = crate::ingress::sni::host_name(name.as_bytes()).ok_or_else(|| crate::NetError::invalid("dnsaddr", "not a host name"))?;
+    let a: Multiaddr = format!("/dns/{host}/tcp/{port}/p2p/{peer}").parse().map_err(|e| crate::NetError::invalid("dnsaddr", format!("{e}")))?;
+    Ok((dnsaddr_name(&host), dnsaddr_txt(&a)?))
+}
+
+/// The address that reaches `peer` by its `_dnsaddr` records: `/dnsaddr/<name>/p2p/<peer>`.
+pub fn dnsaddr_dial(name: &str, peer: &PeerId) -> Multiaddr {
+    Multiaddr::empty().with(Protocol::Dnsaddr(name.trim().trim_end_matches('.').to_string().into())).with(Protocol::P2p(*peer))
 }

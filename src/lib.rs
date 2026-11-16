@@ -38,6 +38,8 @@ pub fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+mod dnsaddr_tests;
+#[cfg(test)]
 mod events_tests;
 #[cfg(test)]
 mod ingress_tests;

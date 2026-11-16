@@ -78,6 +78,9 @@ pub struct NodeConfig {
     /// WebSocket over TLS: the certificate to listen with (put `/…/tcp/443/tls/ws` in
     /// `listen`) and extra roots to trust when dialing. Without it the node still dials WSS.
     pub wss: Option<WssTls>,
+    /// DNS servers for `/dns` and `/dnsaddr` addresses (empty: the system's, or public
+    /// resolvers where the system has none to read, as on Android).
+    pub dns_servers: Vec<std::net::SocketAddr>,
 }
 
 impl NodeConfig {
@@ -386,6 +389,7 @@ fn build_swarm<Q: Message, R: Message>(p: &'static Profile, key: Keypair, cfg: &
     } else {
         let cfg2 = cfg.clone();
         let wss_tls = cfg.wss.clone().unwrap_or_default();
+        let dns = dns_config(&cfg.dns_servers);
         wss_tls.config()?;
         libp2p::SwarmBuilder::with_existing_identity(key)
             .with_tokio()
@@ -402,8 +406,7 @@ fn build_swarm<Q: Message, R: Message>(p: &'static Profile, key: Keypair, cfg: &
                     .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m))))
             })
             .map_err(net_err)?
-            .with_dns()
-            .map_err(net_err)?
+            .with_dns_config(dns.0, dns.1)
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(net_err)?
             .with_behaviour(move |key, relay| behaviour(p, key, relay, &cfg2).map_err(|e| Box::new(e) as BoxErr))
@@ -849,6 +852,31 @@ impl<Q: Message, R: Message> Node<Q, R> {
 impl<Q: Message, R: Message> Drop for Node<Q, R> {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The resolver: the given servers, else the system's, else Cloudflare's and Google's.
+fn dns_config(servers: &[std::net::SocketAddr]) -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts) {
+    use hickory_resolver::config::{CLOUDFLARE, GOOGLE, NameServerConfig, ResolverConfig};
+    if !servers.is_empty() {
+        let ns = servers
+            .iter()
+            .map(|a| {
+                let mut n = NameServerConfig::udp_and_tcp(a.ip());
+                for c in &mut n.connections {
+                    c.port = a.port();
+                }
+                n
+            })
+            .collect();
+        return (ResolverConfig::from_name_servers(ns), Default::default());
+    }
+    match hickory_resolver::system_conf::read_system_conf() {
+        Ok((c, o)) if !c.name_servers().is_empty() => (c, o),
+        _ => {
+            let ns = CLOUDFLARE.udp_and_tcp().chain(GOOGLE.udp_and_tcp()).collect();
+            (ResolverConfig::from_name_servers(ns), Default::default())
+        }
     }
 }
 

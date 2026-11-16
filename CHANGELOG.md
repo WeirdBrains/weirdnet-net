@@ -18,12 +18,14 @@ All notable changes to weirdnet-net are listed here. The format follows
 - CI builds for Android and iOS and tests on macOS and Windows.
 - WebSocket over TLS: dial `/tls/ws` and `/wss` addresses, and listen on them with a certificate.
 - SNI-passthrough ingress: signed grants, DNS-bound names, PROXY v2 headers, HTTP-01 on port 80, per-site revocation.
+- dnsaddr_record, dnsaddr_txt and dnsaddr_dial for `/dnsaddr` names, and a DNS servers setting.
 
 ### Fixed
 
 - A request or dial through a relay no longer fails while the node is still connecting to that relay.
 - A relay reservation that is lost is asked for again.
 - Dropping a stream ends it after what was written instead of resetting it.
+- Nodes start where the system has no resolver configuration to read, as on Android.
 
 ## [0.2.0] - 2026-11-16
 

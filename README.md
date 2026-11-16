@@ -52,6 +52,10 @@ response types, its own storage and its own policy; the crate brings the wire.
   registered names and redirects the rest to HTTPS. `Ingress::revoke(name)` stops a site on
   this device and `set_enabled(false)` stops forwarding altogether. No HTTP/3 passthrough
   and no per-grant byte limits yet.
+- `addr::dnsaddr_record(name, port, peer)`: the `_dnsaddr.<name>` TXT record
+  (`dnsaddr=/dns/<name>/tcp/<port>/p2p/<peer>`) for Grindvakt or any DNS provider to write, and
+  `dnsaddr_dial(name, peer)` to reach the node by it. `NodeConfig::dns_servers` picks the
+  resolver; without it the system's is used, or public resolvers where there is none (Android).
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
