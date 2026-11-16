@@ -253,3 +253,32 @@ fn an_idle_stream_is_reset() {
     assert!(t.read(&mut one).is_err());
     assert!(s.read(&mut one).is_err());
 }
+
+/// Over TCP through a real relay (`WEIRDNET_LIVE_RELAY=/ip4/…/tcp/4747/p2p/…`): a relayed
+/// stream, then a direct dial on loopback moves it.
+#[test]
+#[ignore = "needs a live relay"]
+fn live_relay_stream_moves_to_direct() {
+    let Ok(relay) = std::env::var("WEIRDNET_LIVE_RELAY") else { return };
+    let relay: Multiaddr = relay.parse().unwrap();
+    let tcp = |listen: bool| NodeConfig { listen: if listen { vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()] } else { vec![] }, ..Default::default() };
+    let b = start(NodeConfig { relays: vec![relay.clone()], ..tcp(true) });
+    let rp = crate::addr::addr_peer(&relay).unwrap();
+    wait_for("a reservation", Duration::from_secs(30), || b.status().reservations.contains(&rp.to_string()));
+    echo(&b, Limits::default());
+    let a = Arc::new(start(tcp(false)));
+    let circuit: Multiaddr = format!("{relay}/p2p-circuit/p2p/{}", b.peer_id()).parse().unwrap();
+    let t = Instant::now();
+    let s = a.open_stream(b.peer_id(), std::slice::from_ref(&circuit), P, Limits::default()).unwrap();
+    eprintln!("open through the relay: {:?}, path {:?}", t.elapsed(), s.path());
+    let direct: Multiaddr = b.status().listening.iter().find(|x| x.starts_with("/ip4/127.0.0.1/tcp/")).unwrap().parse().unwrap();
+    let data = pattern(4 * 1024 * 1024);
+    let (a2, bp) = (a.clone(), b.peer_id());
+    let t = Instant::now();
+    let (got, s) = round_trip(s, data.clone(), move |s| {
+        a2.dial(direct.with(libp2p::multiaddr::Protocol::P2p(bp))).unwrap();
+        wait_for("the move to direct", Duration::from_secs(20), || s.path() == Path::Direct);
+    });
+    eprintln!("4 MiB echoed in {:?}, moves {}, path {:?}", t.elapsed(), s.moves(), s.path());
+    assert!(got == data);
+}
