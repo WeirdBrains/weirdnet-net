@@ -11,6 +11,8 @@ use crate::addr::{addr_peer, circuit_relay, reach_rank, routable, shareable};
 use crate::error::{NetError, Result};
 use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
 use crate::profile::Profile;
+use crate::stream::transport::Control;
+use crate::stream::{Incoming, Limits, Path, Stream};
 use futures::StreamExt;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{Boxed, MemoryTransport, Transport};
@@ -29,9 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const REQUEST_MAX: u64 = 8 * 1024 * 1024;
-const RESPONSE_MAX: u64 = 256 * 1024 * 1024;
+/// Request-response defaults ([`NodeConfig::request_max`] and the rest, when left at zero).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_MAX: u64 = 8 * 1024 * 1024;
+pub const RESPONSE_MAX: u64 = 256 * 1024 * 1024;
 
 /// How a node runs.
 #[derive(Debug, Clone, Default)]
@@ -63,6 +66,27 @@ pub struct NodeConfig {
     /// Names servers to register with and look users up on (`…/p2p/ID`), besides the
     /// relays this node holds a reservation on.
     pub names_servers: Vec<Multiaddr>,
+    /// Largest request on the profile's request-response protocol (0: [`REQUEST_MAX`]).
+    /// Bulk data belongs on a [stream](crate::stream) instead.
+    pub request_max: u64,
+    /// Largest response (0: [`RESPONSE_MAX`]).
+    pub response_max: u64,
+    /// How long a request waits for its response (zero: [`REQUEST_TIMEOUT`]).
+    pub request_timeout: Duration,
+}
+
+impl NodeConfig {
+    fn req_max(&self) -> u64 {
+        if self.request_max == 0 { REQUEST_MAX } else { self.request_max }
+    }
+
+    fn resp_max(&self) -> u64 {
+        if self.response_max == 0 { RESPONSE_MAX } else { self.response_max }
+    }
+
+    fn req_timeout(&self) -> Duration {
+        if self.request_timeout.is_zero() { REQUEST_TIMEOUT } else { self.request_timeout }
+    }
 }
 
 /// Limits of the relay server: how many reservations and circuits it holds, and how long
@@ -233,6 +257,7 @@ mod wire {
         pub(super) relay_server: Toggle<relay::Behaviour>,
         pub(super) dcutr: dcutr::Behaviour,
         pub(super) autonat: autonat::Behaviour,
+        pub(super) streams: crate::stream::transport::Behaviour,
     }
 }
 use wire::{Behaviour, BehaviourEvent};
@@ -245,6 +270,9 @@ enum Cmd<Q, R> {
     FindPeer { peer: PeerId, reply: oneshot::Sender<Result<Vec<Multiaddr>>> },
     KnownAddrs { reply: oneshot::Sender<Result<Vec<(PeerId, Multiaddr)>>> },
     Dial { addr: Multiaddr, reply: oneshot::Sender<Result<PeerId>> },
+    Connect { peer: PeerId, addrs: Vec<Multiaddr>, reply: oneshot::Sender<Result<PeerId>> },
+    DropPath { peer: PeerId, path: Path, reply: oneshot::Sender<Result<usize>> },
+    Paths { peer: PeerId, reply: oneshot::Sender<Result<Vec<Path>>> },
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
     Stop,
@@ -257,6 +285,8 @@ pub struct Node<Q: Message, R: Message> {
     names_list: Vec<Multiaddr>,
     tx: mpsc::UnboundedSender<Cmd<Q, R>>,
     status: Arc<Mutex<Status>>,
+    request_timeout: Duration,
+    streams: (tokio::runtime::Handle, Control),
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -276,9 +306,9 @@ fn behaviour<Q: Message, R: Message>(
 ) -> Result<Behaviour<Q, R>> {
     let peer = key.public().to_peer_id();
     let rr = request_response::cbor::Behaviour::with_codec(
-        request_response::cbor::codec::Codec::default().set_request_size_maximum(REQUEST_MAX).set_response_size_maximum(RESPONSE_MAX),
+        request_response::cbor::codec::Codec::default().set_request_size_maximum(cfg.req_max()).set_response_size_maximum(cfg.resp_max()),
         [(StreamProtocol::new(p.protocol), ProtocolSupport::Full)],
-        request_response::Config::default().with_request_timeout(REQUEST_TIMEOUT),
+        request_response::Config::default().with_request_timeout(cfg.req_timeout()),
     );
     let version = if cfg.version.is_empty() { env!("CARGO_PKG_VERSION") } else { cfg.version.as_str() };
     let agent = p.agent(version, &cfg.label);
@@ -311,6 +341,7 @@ fn behaviour<Q: Message, R: Message>(
         relay_server: relay_server.into(),
         dcutr: dcutr::Behaviour::new(peer),
         autonat,
+        streams: crate::stream::transport::Behaviour::new(),
     })
 }
 
@@ -377,6 +408,8 @@ impl<Q: Message, R: Message> Node<Q, R> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let st = status.clone();
         let names_list = cfg.names_servers.clone();
+        let request_timeout = cfg.req_timeout();
+        let (streams_tx, streams_rx) = std::sync::mpsc::channel::<(tokio::runtime::Handle, Control)>();
         let thread = std::thread::Builder::new()
             .name(profile.thread.into())
             .spawn(move || {
@@ -398,6 +431,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
                             for a in &cfg.external {
                                 s.add_external_address(a.clone());
                             }
+                            let _ = streams_tx.send((tokio::runtime::Handle::current(), s.behaviour().streams.control()));
                             s
                         }
                         Err(e) => {
@@ -412,7 +446,10 @@ impl<Q: Message, R: Message> Node<Q, R> {
             })
             .map_err(net_err)?;
         match ready_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(())) => Ok(Node { peer_id, profile, names_list, tx, status, thread: Some(thread) }),
+            Ok(Ok(())) => {
+                let streams = streams_rx.recv().map_err(|_| stopped())?;
+                Ok(Node { peer_id, profile, names_list, tx, status, request_timeout, streams, thread: Some(thread) })
+            }
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -471,7 +508,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
     /// Send a request and wait for the answer. `addrs` are tried if not connected yet.
     pub fn request(&self, peer: PeerId, addrs: &[Multiaddr], wire: Q) -> Result<R> {
         let addrs = addrs.to_vec();
-        self.call(|reply| Cmd::Request { peer, addrs, wire, reply }, REQUEST_TIMEOUT + Duration::from_secs(5))
+        self.call(|reply| Cmd::Request { peer, addrs, wire, reply }, self.request_timeout + Duration::from_secs(5))
     }
 
     /// Ask a names server (a relay, usually) something; `addrs` are tried if not connected.
@@ -593,6 +630,52 @@ impl<Q: Message, R: Message> Node<Q, R> {
         self.call(|reply| Cmd::Dial { addr, reply }, Duration::from_secs(30))
     }
 
+    /// Connect to `peer` if not connected yet, trying `addrs` (or the addresses the node knows).
+    pub fn connect(&self, peer: PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        let addrs = addrs.to_vec();
+        self.call(|reply| Cmd::Connect { peer, addrs, reply }, Duration::from_secs(30)).map(|_| ())
+    }
+
+    /// Close this node's direct or relayed connections to `peer`; returns how many. Streams on
+    /// them move to another path (or wait for one to come back).
+    pub fn drop_path(&self, peer: PeerId, path: Path) -> Result<usize> {
+        self.call(|reply| Cmd::DropPath { peer, path, reply }, Duration::from_secs(5))
+    }
+
+    /// The connections to `peer` now, by kind (one entry per connection).
+    pub fn paths(&self, peer: PeerId) -> Result<Vec<Path>> {
+        self.call(|reply| Cmd::Paths { peer, reply }, Duration::from_secs(5))
+    }
+
+    /// Accept streams of `protocol` (an id of the application's, such as `/myapp/sync/1`).
+    /// Other peers' streams of protocols nobody accepts are refused.
+    pub fn accept_streams(&self, protocol: &str, limits: Limits) -> Result<Incoming> {
+        let p = StreamProtocol::try_from_owned(protocol.to_string()).map_err(|e| NetError::Network(format!("bad protocol id {protocol}: {e}")))?;
+        let (rt, control) = &self.streams;
+        crate::stream::accept(control.clone(), p, limits, rt)
+    }
+
+    /// Open a stream of `protocol` to `peer` (connecting through `addrs` if needed). It starts
+    /// on a direct connection when there is one and moves there later if one comes up.
+    pub fn open_stream(&self, peer: PeerId, addrs: &[Multiaddr], protocol: &str, limits: Limits) -> Result<Stream> {
+        futures::executor::block_on(self.open_stream_async(peer, addrs, protocol, limits))
+    }
+
+    /// [`Node::open_stream`] for async callers (any executor).
+    pub async fn open_stream_async(&self, peer: PeerId, addrs: &[Multiaddr], protocol: &str, limits: Limits) -> Result<Stream> {
+        let p = StreamProtocol::try_from_owned(protocol.to_string()).map_err(|e| NetError::Network(format!("bad protocol id {protocol}: {e}")))?;
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::Connect { peer, addrs: addrs.to_vec(), reply: tx }).map_err(|_| stopped())?;
+        let (rt, control) = &self.streams;
+        let control = control.clone();
+        rt.spawn(async move {
+            tokio::time::timeout(Duration::from_secs(30), rx).await.map_err(|_| NetError::Network(format!("cannot reach {peer} in time")))?.map_err(|_| stopped())??;
+            crate::stream::open(control, peer, p, limits).await
+        })
+        .await
+        .map_err(|_| stopped())?
+    }
+
     /// Listen on one more address; returns the address it got.
     pub fn listen(&self, addr: Multiaddr) -> Result<Multiaddr> {
         self.call(|reply| Cmd::Listen { addr, reply }, Duration::from_secs(20))
@@ -661,6 +744,16 @@ struct Loop<Q: Message, R: Message> {
     /// Commands that go through a relay we are still connecting to (a bootstrap dial to the
     /// same relay under way makes libp2p's relay transport skip its own dial and fail).
     deferred: Vec<(PeerId, std::time::Instant, Cmd<Q, R>)>,
+    /// Open connections: whose, and whether through a relay.
+    conns: HashMap<libp2p::swarm::ConnectionId, (PeerId, bool)>,
+}
+
+fn endpoint_relayed(e: &libp2p::core::ConnectedPoint) -> bool {
+    let circuit = |a: &Multiaddr| a.iter().any(|p| p == Protocol::P2pCircuit);
+    match e {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => circuit(address),
+        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => circuit(local_addr) || circuit(send_back_addr),
+    }
 }
 
 /// How long a command waits for its relay connection before it is tried anyway.
@@ -698,6 +791,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             finds: HashMap::new(),
             addr_book: HashMap::new(),
             deferred: vec![],
+            conns: HashMap::new(),
         }
     }
 
@@ -874,6 +968,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         let addrs: Vec<Multiaddr> = match &c {
             Cmd::Request { addrs, .. } | Cmd::Names { addrs, .. } => addrs.clone(),
             Cmd::Dial { addr, .. } => vec![addr.clone()],
+            Cmd::Connect { peer, addrs, .. } if !self.swarm.is_connected(peer) => addrs.clone(),
             _ => vec![],
         };
         // through a relay we aren't connected to yet: connect to it first (or wait for the
@@ -953,6 +1048,32 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                 }
             }
+            Cmd::Connect { peer, addrs, reply } => {
+                use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+                if self.swarm.is_connected(&peer) {
+                    let _ = reply.send(Ok(peer));
+                    return;
+                }
+                for a in &addrs {
+                    self.swarm.add_peer_address(peer, a.clone());
+                }
+                let first = addrs.first().cloned().unwrap_or_else(|| Multiaddr::empty().with(Protocol::P2p(peer)));
+                match self.swarm.dial(DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build()) {
+                    Ok(()) | Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => self.dials.push((first, Some(peer), reply)),
+                    Err(e) => {
+                        let _ = reply.send(Err(net_err(e)));
+                    }
+                }
+            }
+            Cmd::DropPath { peer, path, reply } => {
+                let ids: Vec<_> = self.conns.iter().filter(|(_, (p, relayed))| *p == peer && (*relayed == (path == Path::Relayed))).map(|(c, _)| *c).collect();
+                let n = ids.iter().filter(|c| self.swarm.close_connection(**c)).count();
+                let _ = reply.send(Ok(n));
+            }
+            Cmd::Paths { peer, reply } => {
+                let v = self.conns.values().filter(|(p, _)| *p == peer).map(|(_, r)| if *r { Path::Relayed } else { Path::Direct }).collect();
+                let _ = reply.send(Ok(v));
+            }
             Cmd::Listen { addr, reply } => match self.swarm.listen_on(addr) {
                 Ok(id) => {
                     self.listens.insert(id, reply);
@@ -993,8 +1114,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 self.refresh()
             }
             SwarmEvent::ExternalAddrExpired { .. } | SwarmEvent::ExpiredListenAddr { .. } => self.refresh(),
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                 self.release_deferred(Some(peer_id));
+                self.conns.insert(connection_id, (peer_id, endpoint_relayed(&endpoint)));
                 let addr = endpoint.get_remote_address().clone();
                 if endpoint.is_dialer() {
                     let a = if addr_peer(&addr) == Some(peer_id) { addr.clone() } else { addr.clone().with(Protocol::P2p(peer_id)) };
@@ -1015,7 +1137,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 self.refresh();
             }
-            SwarmEvent::ConnectionClosed { .. } => self.refresh(),
+            SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                self.conns.remove(&connection_id);
+                self.refresh()
+            }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 if let Some(p) = peer_id
                     && !self.swarm.is_connected(&p)
@@ -1212,6 +1337,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                 });
             }
+            BehaviourEvent::Streams(e) => match e {},
             BehaviourEvent::Dcutr(e) => {
                 tracing::debug!("network: hole punch with {}: {}", e.remote_peer_id, if e.result.is_ok() { "direct" } else { "failed" });
             }

@@ -39,15 +39,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// A stream and whether its connection goes through a relay.
-pub(crate) type Opened = (Stream, bool);
-/// An inbound stream: who opened it, the stream, and whether it is relayed.
-pub(crate) type Inbound = (PeerId, Stream, bool);
+/// A stream, whether its connection goes through a relay, and which connection it is.
+pub(crate) type Opened = (Stream, bool, ConnectionId);
+/// An inbound stream: who opened it, the stream, whether it is relayed, its connection.
+pub(crate) type Inbound = (PeerId, Stream, bool, ConnectionId);
 
 /// A connection to `peer` came up or went away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PathEvent {
     pub(crate) peer: PeerId,
+    pub(crate) conn: ConnectionId,
     pub(crate) relayed: bool,
     pub(crate) up: bool,
 }
@@ -105,9 +106,9 @@ impl Shared {
         self.inbound.keys().cloned().collect()
     }
 
-    fn on_inbound(&mut self, remote: PeerId, stream: Stream, protocol: StreamProtocol, relayed: bool) {
+    fn on_inbound(&mut self, remote: PeerId, stream: Stream, protocol: StreamProtocol, relayed: bool, conn: ConnectionId) {
         if let hash_map::Entry::Occupied(mut e) = self.inbound.entry(protocol.clone()) {
-            match e.get_mut().try_send((remote, stream, relayed)) {
+            match e.get_mut().try_send((remote, stream, relayed, conn)) {
                 Ok(()) => {}
                 Err(err) if err.is_disconnected() => {
                     e.remove();
@@ -188,7 +189,7 @@ impl Behaviour {
         let mut s = lock(&self.shared);
         let receiver = s.receiver(peer, conn);
         s.connections.insert(conn, Conn { peer, relayed, since: Instant::now() });
-        Handler { remote: peer, relayed, shared: self.shared.clone(), receiver, pending: None }
+        Handler { remote: peer, conn, relayed, shared: self.shared.clone(), receiver, pending: None }
     }
 }
 
@@ -222,7 +223,7 @@ impl NetworkBehaviour for Behaviour {
             FromSwarm::ConnectionEstablished(ConnectionEstablished { peer_id, connection_id, .. }) => {
                 let mut s = lock(&self.shared);
                 if let Some(c) = s.connections.get(&connection_id) {
-                    let ev = PathEvent { peer: peer_id, relayed: c.relayed, up: true };
+                    let ev = PathEvent { peer: peer_id, conn: connection_id, relayed: c.relayed, up: true };
                     s.notify(ev);
                 }
             }
@@ -230,7 +231,7 @@ impl NetworkBehaviour for Behaviour {
                 let mut s = lock(&self.shared);
                 s.senders.remove(&connection_id);
                 if let Some(c) = s.connections.remove(&connection_id) {
-                    s.notify(PathEvent { peer: peer_id, relayed: c.relayed, up: false });
+                    s.notify(PathEvent { peer: peer_id, conn: connection_id, relayed: c.relayed, up: false });
                 }
             }
             FromSwarm::DialFailure(DialFailure {
@@ -317,6 +318,7 @@ impl Drop for Warm {
 
 pub(crate) struct Handler {
     remote: PeerId,
+    conn: ConnectionId,
     relayed: bool,
     shared: Arc<Mutex<Shared>>,
     receiver: mpsc::Receiver<NewStream>,
@@ -359,11 +361,11 @@ impl ConnectionHandler for Handler {
     fn on_connection_event(&mut self, event: ConnectionEvent<Upgrade, Upgrade>) {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound { protocol: (stream, protocol), .. }) => {
-                lock(&self.shared).on_inbound(self.remote, stream, protocol, self.relayed);
+                lock(&self.shared).on_inbound(self.remote, stream, protocol, self.relayed, self.conn);
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound { protocol: (stream, _), .. }) => {
                 if let Some((_, tx)) = self.pending.take() {
-                    let _ = tx.send(Ok((stream, self.relayed)));
+                    let _ = tx.send(Ok((stream, self.relayed, self.conn)));
                 }
             }
             ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => {

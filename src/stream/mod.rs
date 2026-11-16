@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use libp2p::swarm::ConnectionId;
 use transport::{Control, OpenError, PathEvent, Warm};
 
 /// How streams of one protocol behave.
@@ -336,10 +337,11 @@ impl Incoming {
     pub fn accept_timeout(&mut self, d: Duration) -> Option<Stream> {
         let deadline = Instant::now() + d;
         loop {
-            match self.rx.try_next() {
-                Ok(s) => return s,
-                Err(_) if Instant::now() >= deadline => return None,
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            match self.rx.try_recv() {
+                Ok(s) => return Some(s),
+                Err(mpsc::TryRecvError::Closed) => return None,
+                Err(mpsc::TryRecvError::Empty) if Instant::now() >= deadline => return None,
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
             }
         }
     }
@@ -362,6 +364,7 @@ impl futures::Stream for Incoming {
 struct Resume {
     sub: Sub,
     relayed: bool,
+    conn: ConnectionId,
     recv: u64,
 }
 
@@ -400,11 +403,11 @@ struct AppEnds {
 /// Open a stream of `protocol` to `peer` (already connected or dialable by peer id).
 pub(crate) async fn open(control: Control, peer: PeerId, protocol: StreamProtocol, limits: Limits) -> crate::Result<Stream> {
     let id = u64::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap_or_default());
-    let (sub, relayed, _) = handshake(&control, peer, &protocol, id, false, 0, &limits).await?;
+    let watch = control.watch();
+    let (sub, relayed, conn, _) = handshake(&control, peer, &protocol, id, false, 0, &limits).await?;
     let (s, ends, info) = app_side(peer, &protocol, &limits, relayed);
-    let warm = control.watch();
-    let d = Driver::new(peer, protocol, id, true, limits, control, ends, info, warm, None);
-    tokio::spawn(d.run(sub, relayed));
+    let d = Driver::new(peer, protocol, id, true, limits, control, ends, info, watch, None);
+    tokio::spawn(d.run(sub, relayed, conn));
     Ok(s)
 }
 
@@ -417,19 +420,19 @@ async fn handshake(
     resume: bool,
     recv: u64,
     limits: &Limits,
-) -> crate::Result<(Sub, bool, u64)> {
+) -> crate::Result<(Sub, bool, ConnectionId, u64)> {
     let opened = tokio::time::timeout(HANDSHAKE, control.open(peer, protocol.clone()))
         .await
         .map_err(|_| crate::NetError::Network(format!("no stream to {peer} in time")))?
         .map_err(stream_err)?;
-    let (s, relayed) = opened;
+    let (s, relayed, conn) = opened;
     let (mut r, mut w) = s.split();
     let shake = async {
         write_frame(&mut w, &Frame::Hello { resume, id, recv }).await?;
         read_frame(&mut r, limits.max_frame).await
     };
     match tokio::time::timeout(HANDSHAKE, shake).await {
-        Ok(Ok(Frame::Welcome { recv })) => Ok(((r, w), relayed, recv)),
+        Ok(Ok(Frame::Welcome { recv })) => Ok(((r, w), relayed, conn, recv)),
         Ok(Ok(Frame::Refuse(REFUSE_BUSY))) => Err(crate::NetError::Network(format!("{peer} has too many {protocol} streams"))),
         Ok(Ok(Frame::Refuse(_))) => Err(crate::NetError::Network(format!("{peer} refused the {protocol} stream"))),
         Ok(Ok(_)) => Err(crate::NetError::Network("unexpected stream frame".into())),
@@ -444,12 +447,14 @@ pub(crate) fn accept(control: Control, protocol: StreamProtocol, limits: Limits,
     let Some(mut inbound) = control.accept(protocol.clone(), limits.backlog.max(1)) else {
         return Err(crate::NetError::Network(format!("{protocol} streams are accepted already")));
     };
-    let (tx, rx) = mpsc::channel(limits.backlog.max(1));
+    // one sender, so the channel holds exactly `backlog` streams (each clone would add a slot)
+    let (tx, rx) = mpsc::channel(limits.backlog.max(1) - 1);
+    let tx = Arc::new(Mutex::new(tx));
     let registry: Registry = Arc::default();
     let p = protocol.clone();
     let task = rt.spawn(async move {
-        while let Some((peer, s, relayed)) = inbound.next().await {
-            let (control, protocol, registry, mut tx) = (control.clone(), p.clone(), registry.clone(), tx.clone());
+        while let Some((peer, s, relayed, conn)) = inbound.next().await {
+            let (control, protocol, registry, tx) = (control.clone(), p.clone(), registry.clone(), tx.clone());
             tokio::spawn(async move {
                 let (mut r, mut w) = s.split();
                 let hello = tokio::time::timeout(HANDSHAKE, read_frame(&mut r, limits.max_frame)).await;
@@ -458,7 +463,7 @@ pub(crate) fn accept(control: Control, protocol: StreamProtocol, limits: Limits,
                     let to = registry.lock().ok().and_then(|m| m.get(&(peer, id)).cloned());
                     match to {
                         Some(to) => {
-                            let _ = to.unbounded_send(Resume { sub: (r, w), relayed, recv });
+                            let _ = to.unbounded_send(Resume { sub: (r, w), relayed, conn, recv });
                         }
                         None => {
                             let _ = write_frame(&mut w, &Frame::Refuse(REFUSE_UNKNOWN)).await;
@@ -472,7 +477,8 @@ pub(crate) fn accept(control: Control, protocol: StreamProtocol, limits: Limits,
                     return;
                 }
                 let (s, ends, info) = app_side(peer, &protocol, &limits, relayed);
-                if tx.try_send(s).is_err() {
+                let queued = tx.lock().map(|mut t| t.try_send(s).is_ok()).unwrap_or(false);
+                if !queued {
                     let _ = write_frame(&mut w, &Frame::Refuse(REFUSE_BUSY)).await;
                     return;
                 }
@@ -485,13 +491,15 @@ pub(crate) fn accept(control: Control, protocol: StreamProtocol, limits: Limits,
                 }
                 let watch = control.watch();
                 let d = Driver::new(peer, protocol, id, false, limits, control, ends, info, watch, Some(rrx));
-                d.run((r, w), relayed).await;
+                d.run((r, w), relayed, conn).await;
                 if let Ok(mut m) = registry.lock() {
                     m.remove(&(peer, id));
                 }
             });
         }
-        let _ = tx.close().await;
+        if let Ok(mut t) = tx.lock() {
+            t.close_channel();
+        }
     });
     Ok(Incoming { protocol: protocol.to_string(), rx, _task: Abort(task.abort_handle()) })
 }
@@ -511,9 +519,14 @@ struct Driver {
     // the current substream's writer and generation; frames from every reader
     writer: Option<WriteHalf<libp2p::Stream>>,
     relayed: bool,
+    conn: Option<ConnectionId>,
+    want_move: bool,
     generation: u64,
-    frames_tx: mpsc::Sender<(u64, Option<Frame>)>,
-    frames: mpsc::Receiver<(u64, Option<Frame>)>,
+    frames_tx: mpsc::Sender<(u64, Frame)>,
+    frames: mpsc::Receiver<(u64, Frame)>,
+    // a substream's reader saw it end (apart from frames, which wait while the inbox is full)
+    lost_tx: mpsc::UnboundedSender<u64>,
+    lost: mpsc::UnboundedReceiver<u64>,
     // sending: bytes from `acked` on, the next offset to write, the total once closed
     out: VecDeque<u8>,
     acked: u64,
@@ -525,6 +538,9 @@ struct Driver {
     inbox: VecDeque<Vec<u8>>,
     inbox_bytes: usize,
     recv: u64,
+    // bytes handed to the application (or dropped for it): what we acknowledge, so a sender's
+    // window bounds what we buffer and frames never have to wait
+    delivered: u64,
     ack_sent: u64,
     peer_fin: Option<u64>,
     app_out: Option<mpsc::Sender<Chunk>>,
@@ -554,6 +570,7 @@ impl Driver {
         resumes: Option<mpsc::UnboundedReceiver<Resume>>,
     ) -> Self {
         let (frames_tx, frames) = mpsc::channel(16);
+        let (lost_tx, lost) = mpsc::unbounded();
         Driver {
             peer,
             protocol,
@@ -567,9 +584,13 @@ impl Driver {
             resumes,
             writer: None,
             relayed: false,
+            conn: None,
+            want_move: false,
             generation: 0,
             frames_tx,
             frames,
+            lost_tx,
+            lost,
             out: VecDeque::new(),
             acked: 0,
             sent: 0,
@@ -579,6 +600,7 @@ impl Driver {
             inbox: VecDeque::new(),
             inbox_bytes: 0,
             recv: 0,
+            delivered: 0,
             ack_sent: 0,
             peer_fin: None,
             app_out: Some(ends.app_out),
@@ -588,7 +610,7 @@ impl Driver {
     }
 
     /// Make `sub` the stream's substream; the peer has `peer_recv` bytes of ours.
-    fn adopt(&mut self, sub: Sub, relayed: bool, peer_recv: u64) {
+    fn adopt(&mut self, sub: Sub, relayed: bool, conn: ConnectionId, peer_recv: u64) {
         let (mut r, w) = sub;
         if let Some(mut old) = self.writer.replace(w) {
             tokio::spawn(async move {
@@ -600,23 +622,24 @@ impl Driver {
         }
         self.generation += 1;
         self.relayed = relayed;
+        self.conn = Some(conn);
         self.info.relayed.store(relayed, Ordering::Relaxed);
         self.on_ack(peer_recv);
         self.sent = self.acked;
         self.fin_sent = None;
         // what we have counts as acknowledged: the handshake carried it
         self.ack_sent = self.ack_sent.max(self.recv);
-        let (g, mut tx, max) = (self.generation, self.frames_tx.clone(), self.limits.max_frame);
+        let (g, mut tx, lost, max) = (self.generation, self.frames_tx.clone(), self.lost_tx.clone(), self.limits.max_frame);
         tokio::spawn(async move {
             loop {
                 match read_frame(&mut r, max).await {
                     Ok(f) => {
-                        if tx.send((g, Some(f))).await.is_err() {
+                        if tx.send((g, f)).await.is_err() {
                             break;
                         }
                     }
                     Err(_) => {
-                        let _ = tx.send((g, None)).await;
+                        let _ = lost.unbounded_send(g);
                         break;
                     }
                 }
@@ -633,11 +656,15 @@ impl Driver {
         }
     }
 
-    async fn run(mut self, sub: Sub, relayed: bool) {
-        self.adopt(sub, relayed, 0);
+    async fn run(mut self, sub: Sub, relayed: bool, conn: ConnectionId) {
+        self.adopt(sub, relayed, conn, 0);
         let mut done_at: Option<Instant> = None;
         let mut tick = tokio::time::interval(ACK_EVERY);
         loop {
+            if self.want_move {
+                self.want_move = false;
+                self.migrate().await;
+            }
             let step = if self.writer.is_some() { self.flush().await } else { Step::Lost };
             let step = match step {
                 Step::Go => self.select(&mut tick, done_at).await,
@@ -652,6 +679,7 @@ impl Driver {
                         return;
                     }
                     self.writer = None;
+                    self.conn = None;
                     if let Err(e) = self.recover().await {
                         return self.fail(e).await;
                     }
@@ -700,36 +728,49 @@ impl Driver {
             encode(&Frame::Fin(f), &mut batch);
             self.fin_sent = Some(self.generation);
         }
-        if self.recv > self.ack_sent && (self.recv - self.ack_sent >= (self.limits.window / 4) as u64 || self.peer_fin.is_some()) {
-            encode(&Frame::Ack(self.recv), &mut batch);
-            self.ack_sent = self.recv;
+        if self.delivered > self.ack_sent && (self.delivered - self.ack_sent >= (self.limits.window / 4) as u64 || self.peer_fin.is_some()) {
+            encode(&Frame::Ack(self.delivered), &mut batch);
+            self.ack_sent = self.delivered;
         }
         if batch.is_empty() {
             return Step::Go;
         }
         self.last = Instant::now();
-        match async {
+        // a write can hang on a connection that is closing: its going away ends the wait
+        let (conn, watch, peer, opener, relayed) = (self.conn, &mut self.watch, self.peer, self.opener, self.relayed);
+        let mut want_move = false;
+        let write = async {
             w.write_all(&batch).await?;
             w.flush().await
-        }
-        .await
-        {
-            Ok(()) => Step::Go,
-            Err(_) => Step::Lost,
-        }
+        };
+        tokio::pin!(write);
+        let step = loop {
+            tokio::select! {
+                r = &mut write => break if r.is_ok() { Step::Go } else { Step::Lost },
+                ev = watch.next() => match ev {
+                    Some(ev) if !ev.up && Some(ev.conn) == conn => break Step::Lost,
+                    Some(ev) if moves_to(&ev, peer, opener, relayed) => want_move = true,
+                    _ => {}
+                },
+            }
+        };
+        self.want_move |= want_move;
+        step
     }
 
     async fn select(&mut self, tick: &mut tokio::time::Interval, done_at: Option<Instant>) -> Step {
         let window = self.limits.window;
-        let can_read = self.inbox_bytes < window;
         let can_take = self.app_in.is_some() && self.out.len() < window;
         let deliver = !self.inbox.is_empty() || (self.peer_fin.is_some_and(|f| f == self.recv) && self.app_out.is_some());
         let idle = self.limits.idle.map(|d| self.last + d);
         let linger = done_at.map(|t| t + LINGER);
         tokio::select! {
-            f = self.frames.next(), if can_read => match f {
-                Some((g, Some(f))) => self.frame(g, f),
-                Some((g, None)) if g == self.generation => Step::Lost,
+            f = self.frames.next() => match f {
+                Some((g, f)) => self.frame(g, f),
+                None => Step::Go,
+            },
+            g = self.lost.next() => match g {
+                Some(g) if g == self.generation => Step::Lost,
                 _ => Step::Go,
             },
             c = async { self.app_in.as_mut().unwrap().next().await }, if can_take => {
@@ -750,13 +791,14 @@ impl Driver {
                 self.deliver(r);
                 Step::Go
             }
-            ev = self.watch.next() => {
-                match ev {
-                    Some(ev) if self.opener && ev.up && !ev.relayed && ev.peer == self.peer && self.relayed => self.migrate().await,
-                    _ => {}
+            ev = self.watch.next() => match ev {
+                Some(ev) if !ev.up && Some(ev.conn) == self.conn => Step::Lost,
+                Some(ev) if moves_to(&ev, self.peer, self.opener, self.relayed) => {
+                    self.want_move = true;
+                    Step::Go
                 }
-                Step::Go
-            }
+                _ => Step::Go,
+            },
             r = async { self.resumes.as_mut().unwrap().next().await }, if self.resumes.is_some() => {
                 if let Some(r) = r {
                     self.take_resume(r).await;
@@ -765,9 +807,9 @@ impl Driver {
             }
             _ = self.reset_rx.next() => Step::Fail("reset".into()),
             _ = tick.tick() => {
-                if self.recv > self.ack_sent && let Some(w) = self.writer.as_mut() {
-                    self.ack_sent = self.recv;
-                    if write_frame(w, &Frame::Ack(self.recv)).await.is_err() {
+                if self.delivered > self.ack_sent && let Some(w) = self.writer.as_mut() {
+                    self.ack_sent = self.delivered;
+                    if write_frame(w, &Frame::Ack(self.delivered)).await.is_err() {
                         return Step::Lost;
                     }
                 }
@@ -791,8 +833,12 @@ impl Driver {
                 if off <= self.recv && end > self.recv {
                     let tail = bytes[(self.recv - off) as usize..].to_vec();
                     self.recv = end;
-                    self.inbox_bytes += tail.len();
-                    self.inbox.push_back(tail);
+                    if self.app_out.is_some() {
+                        self.inbox_bytes += tail.len();
+                        self.inbox.push_back(tail);
+                    } else {
+                        self.delivered = self.recv;
+                    }
                 }
                 Step::Go
             }
@@ -815,12 +861,14 @@ impl Driver {
             self.app_out = None;
             self.inbox.clear();
             self.inbox_bytes = 0;
+            self.delivered = self.recv;
             return;
         }
         let Some(tx) = self.app_out.as_mut() else { return };
         match self.inbox.pop_front() {
             Some(v) => {
                 self.inbox_bytes -= v.len();
+                self.delivered += v.len() as u64;
                 if tx.start_send(Ok(v)).is_err() {
                     self.app_out = None;
                 }
@@ -835,16 +883,16 @@ impl Driver {
             return;
         }
         match handshake(&self.control, self.peer, &self.protocol, self.id, true, self.recv, &self.limits).await {
-            Ok((sub, false, peer_recv)) => self.adopt(sub, false, peer_recv),
+            Ok((sub, false, conn, peer_recv)) => self.adopt(sub, false, conn, peer_recv),
             Ok(_) => {}
             Err(e) => tracing::debug!(peer = %self.peer, "network: stream stays relayed: {e}"),
         }
     }
 
     async fn take_resume(&mut self, r: Resume) {
-        let Resume { sub: (rd, mut w), relayed, recv } = r;
+        let Resume { sub: (rd, mut w), relayed, conn, recv } = r;
         if write_frame(&mut w, &Frame::Welcome { recv: self.recv }).await.is_ok() {
-            self.adopt((rd, w), relayed, recv);
+            self.adopt((rd, w), relayed, conn, recv);
         }
     }
 
@@ -858,8 +906,8 @@ impl Driver {
             }
             if self.opener {
                 match handshake(&self.control, self.peer, &self.protocol, self.id, true, self.recv, &self.limits).await {
-                    Ok((sub, relayed, peer_recv)) => {
-                        self.adopt(sub, relayed, peer_recv);
+                    Ok((sub, relayed, conn, peer_recv)) => {
+                        self.adopt(sub, relayed, conn, peer_recv);
                         return Ok(());
                     }
                     Err(e) if e.to_string().contains("refused") => return Err(e.to_string()),
@@ -882,6 +930,11 @@ impl Driver {
             }
         }
     }
+}
+
+/// The opener moves a relayed stream when a direct connection to its peer comes up.
+fn moves_to(ev: &PathEvent, peer: PeerId, opener: bool, relayed: bool) -> bool {
+    opener && relayed && ev.up && !ev.relayed && ev.peer == peer
 }
 
 #[cfg(test)]

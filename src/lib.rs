@@ -9,6 +9,7 @@ pub mod node;
 pub mod profile;
 pub mod sealed;
 pub mod shard;
+pub mod stream;
 pub mod sync;
 pub mod user;
 
@@ -18,6 +19,7 @@ pub use libp2p::identity::{Keypair, PublicKey};
 pub use libp2p::{Multiaddr, PeerId};
 pub use node::{Handler, Message, Node, NodeConfig, RelayLimits, Sighting, Status};
 pub use profile::{Profile, WEIRDNET};
+pub use stream::{Incoming, Limits, Path, Stream};
 pub use weirdnet_keys::{Key32, Sealed};
 
 /// The last 8 characters of a peer id.
@@ -34,5 +36,7 @@ pub fn now_ms() -> i64 {
 mod names_tests;
 #[cfg(test)]
 mod relay_tests;
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests;
