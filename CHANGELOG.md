@@ -6,6 +6,11 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Locator records for private sites: sealed, signed by a locator key, under a daily DHT key.
+- EntryCache for peer records pushed to trusted peers.
+
 ## [0.3.0] - 2026-11-16
 
 ### Added

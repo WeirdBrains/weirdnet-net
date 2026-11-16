@@ -450,3 +450,46 @@ pub fn serve(p: &Profile, store: &dyn NameStore, from: &PeerId, req: NamesReques
         }
     }
 }
+
+/// What a trusted peer keeps of the records others push to it: the newest valid entry per
+/// user, by the same rule as the DHT ([`Profile::accept`]). Pushing is the application's
+/// (over its exchange or a request); the cache only decides what to keep.
+#[derive(Debug, Clone, Default)]
+pub struct EntryCache {
+    entries: std::collections::HashMap<String, Entry>,
+    max: usize,
+}
+
+impl EntryCache {
+    /// Keep up to `max` users (the oldest-expiring is dropped first when full).
+    pub fn new(max: usize) -> Self {
+        EntryCache { entries: Default::default(), max: max.max(1) }
+    }
+
+    /// Keep `e` if it verifies and supersedes what is held. Errors say why not.
+    pub fn offer(&mut self, profile: &Profile, e: Entry, now: i64) -> Result<()> {
+        profile.accept(self.entries.get(e.user_id()), &e, now)?;
+        self.entries.retain(|_, x| x.expires() > now);
+        if !self.entries.contains_key(e.user_id())
+            && self.entries.len() >= self.max
+            && let Some(k) = self.entries.iter().min_by_key(|(_, x)| x.expires()).map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&k);
+        }
+        self.entries.insert(e.user_id().to_string(), e);
+        Ok(())
+    }
+
+    /// The held entry for `user`, as a lookup.
+    pub fn lookup(&self, profile: &Profile, user: &str, now: i64) -> Lookup {
+        profile.newest(user, self.entries.get(user), now)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
