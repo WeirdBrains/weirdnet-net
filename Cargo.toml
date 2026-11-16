@@ -24,7 +24,11 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 tracing = "0.1"
 futures = "0.3"
+rustls-pki-types = { version = "1.12", features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
-libp2p = { version = "0.57", default-features = false, features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "mdns", "kad", "identify", "ping", "relay", "dcutr", "autonat", "request-response", "cbor", "macros", "ed25519"] }
+libp2p = { version = "0.57", default-features = false, features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "mdns", "kad", "identify", "ping", "relay", "dcutr", "autonat", "request-response", "websocket", "cbor", "macros", "ed25519"] }
 # every derivation, seal and open goes through the keys crate
 weirdnet-keys = { version = "0.1.0", default-features = false }
+
+[dev-dependencies]
+rcgen = "0.13"

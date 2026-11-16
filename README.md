@@ -36,6 +36,11 @@ response types, its own storage and its own policy; the crate brings the wire.
   again with backoff. `request_async`, `connect_async` and `dial_async` suit async callers on
   any executor. CI checks Android (aarch64-linux-android) and iOS (aarch64-apple-ios) builds and
   runs the tests on Linux, macOS and Windows.
+- `wss`: WebSocket over TLS for networks that only let HTTPS out. Every node dials
+  `/dns/<name>/tcp/443/tls/ws/p2p/<id>` (or `/wss`) trusting the web PKI; with
+  `NodeConfig::wss` set to a `WssTls` (`from_pem_files("fullchain.pem", "privkey.pem")`) a node
+  also listens on `/ip4/0.0.0.0/tcp/443/tls/ws`. Noise and Yamux run inside, so peer ids are
+  checked as on TCP. A renewed certificate takes a restart for now.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher

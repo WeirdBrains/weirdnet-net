@@ -14,6 +14,7 @@ use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
 use crate::profile::Profile;
 use crate::stream::transport::Control;
 use crate::stream::{Incoming, Limits, Path, Stream};
+use crate::wss::WssTls;
 use futures::StreamExt;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{Boxed, MemoryTransport, Transport};
@@ -74,6 +75,9 @@ pub struct NodeConfig {
     pub response_max: u64,
     /// How long a request waits for its response (zero: [`REQUEST_TIMEOUT`]).
     pub request_timeout: Duration,
+    /// WebSocket over TLS: the certificate to listen with (put `/…/tcp/443/tls/ws` in
+    /// `listen`) and extra roots to trust when dialing. Without it the node still dials WSS.
+    pub wss: Option<WssTls>,
 }
 
 impl NodeConfig {
@@ -381,11 +385,23 @@ fn build_swarm<Q: Message, R: Message>(p: &'static Profile, key: Keypair, cfg: &
             .build()
     } else {
         let cfg2 = cfg.clone();
+        let wss_tls = cfg.wss.clone().unwrap_or_default();
+        wss_tls.config()?;
         libp2p::SwarmBuilder::with_existing_identity(key)
             .with_tokio()
             .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
             .map_err(net_err)?
             .with_quic()
+            .with_other_transport(|key| -> std::result::Result<_, BoxErr> {
+                let mut ws = libp2p::websocket::Config::new(tcp::tokio::Transport::new(tcp::Config::default().nodelay(true)));
+                ws.set_tls_config(wss_tls.config()?);
+                Ok(ws
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(noise::Config::new(key)?)
+                    .multiplex(yamux::Config::default())
+                    .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m))))
+            })
+            .map_err(net_err)?
             .with_dns()
             .map_err(net_err)?
             .with_relay_client(noise::Config::new, yamux::Config::default)

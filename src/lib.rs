@@ -13,6 +13,7 @@ pub mod shard;
 pub mod stream;
 pub mod sync;
 pub mod user;
+pub mod wss;
 
 pub use error::{NetError, Result};
 pub use events::{Event, Events, StatusWatch};
@@ -23,6 +24,7 @@ pub use node::{Handler, Message, Node, NodeConfig, RelayLimits, Sighting, Status
 pub use profile::{Profile, WEIRDNET};
 pub use stream::{Incoming, Limits, Path, Stream};
 pub use weirdnet_keys::{Key32, Sealed};
+pub use wss::WssTls;
 
 /// The last 8 characters of a peer id.
 pub fn short_peer_id(p: &PeerId) -> String {
@@ -44,3 +46,5 @@ mod relay_tests;
 mod stream_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wss_tests;
