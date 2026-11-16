@@ -288,3 +288,91 @@ fn content_providers_are_found_in_the_dht() {
     let (_, st) = content::fetch(&c, &[found[0].into()], &root, Arc::new(MemoryStore::default())).unwrap();
     assert_eq!(st.chunks, 2);
 }
+
+#[test]
+fn locator_records_seal_open_and_refuse_tampering() {
+    use crate::locator::{self, LocatorKeys};
+    let (u, n) = (user(), Keypair::generate_ed25519());
+    let rec = record(&u, &n, 5);
+    let now = now_ms();
+    let lk = LocatorKeys::generate().unwrap();
+    let l = lk.seal("garden-site", &rec, 1, now, now + HOUR).unwrap();
+    l.verify(now).unwrap();
+    assert_eq!(l.key().unwrap(), locator::dht_key(&lk.key.public(), locator::epoch_of(now)));
+    let (site, got) = lk.open(&WEIRDNET, &l, now).unwrap();
+    assert_eq!((site.as_str(), &got), ("garden-site", &rec));
+    // nothing about the owner shows
+    let raw = String::from_utf8(l.encode()).unwrap();
+    assert!(!raw.contains(&u.id) && !raw.contains("garden") && !raw.contains("203.0.113.7"));
+    // the keys change every day
+    assert_ne!(locator::dht_key(&lk.key.public(), 1), locator::dht_key(&lk.key.public(), 2));
+    assert_eq!(locator::lookup_keys(&lk.key.public(), now).len(), 2);
+
+    // shared and restored
+    let (k, s) = lk.to_bytes().unwrap();
+    let again = LocatorKeys::from_bytes(&k, s).unwrap();
+    assert!(again.open(&WEIRDNET, &l, now).is_ok());
+    // a wrong secret or another locator cannot open it
+    let wrong = LocatorKeys::from_bytes(&k, [9u8; 32]).unwrap();
+    assert!(wrong.open(&WEIRDNET, &l, now).is_err());
+    assert!(LocatorKeys::generate().unwrap().open(&WEIRDNET, &l, now).is_err());
+    // tampering breaks the signature
+    let mut t = l.clone();
+    t.seq = 99;
+    assert!(t.verify(now).is_err());
+    // expiry is capped at the end of the day (plus grace) and old epochs are refused
+    let long = lk.seal("s", &rec, 2, now, now + 10 * HOUR * 24).unwrap();
+    assert!(long.expires <= (locator::epoch_of(now) as i64 + 1) * locator::EPOCH_MS + locator::EPOCH_GRACE_MS);
+    assert!(l.verify(now + 3 * locator::EPOCH_MS).is_err());
+    // storing nodes keep only a higher seq, under the right key
+    let key = l.key().unwrap();
+    locator::accept_locator(&key, None, &l, now).unwrap();
+    assert!(locator::accept_locator(&key, Some(&long), &l, now).is_err());
+    assert!(locator::accept_locator(&[0u8; 32], None, &l, now).is_err());
+    assert_eq!(locator::newest_open(&lk, &WEIRDNET, &[l.clone(), long.clone()], now).unwrap().0, "s");
+}
+
+#[test]
+fn locator_records_go_through_the_dht() {
+    use crate::locator::LocatorKeys;
+    let (r, raddr) = relay();
+    let boot = || NodeConfig { bootstrap: vec![raddr.clone()], ..mem(false) };
+    let (u, nkey) = (user(), Keypair::generate_ed25519());
+    let b = Node::start(&WEIRDNET, nkey.clone(), boot(), Arc::new(Greeter)).unwrap();
+    let c = Node::start(&WEIRDNET, Keypair::generate_ed25519(), boot(), Arc::new(Greeter)).unwrap();
+    wait("bootstrap", || b.status().connected.contains(&r.peer_id().to_string()) && c.status().connected.contains(&r.peer_id().to_string()));
+    let lk = LocatorKeys::generate().unwrap();
+    let now = now_ms();
+    let l = lk.seal("orchard", &record(&u, &nkey, 1), 1, now, now + HOUR).unwrap();
+    b.put_locator(l.clone()).unwrap();
+    let mut found = vec![];
+    wait("locator", || {
+        found = c.get_locators(&lk.key.public()).unwrap_or_default();
+        !found.is_empty()
+    });
+    let (site, rec) = crate::locator::newest_open(&lk, &WEIRDNET, &found, now_ms()).unwrap();
+    assert_eq!(site, "orchard");
+    assert_eq!(rec.user_id, u.id);
+    // an older seq is refused
+    let older = lk.seal("orchard", &record(&u, &nkey, 1), 0, now, now + HOUR).unwrap();
+    assert!(b.put_locator(older).is_err());
+}
+
+#[test]
+fn a_trusted_peer_caches_the_newest_pushed_record() {
+    use crate::names::{EntryCache, Lookup};
+    let (u, n) = (user(), Keypair::generate_ed25519());
+    let now = now_ms();
+    let mut c = EntryCache::new(2);
+    c.offer(&WEIRDNET, Entry::Record(record(&u, &n, 2)), now).unwrap();
+    assert!(c.offer(&WEIRDNET, Entry::Record(record(&u, &n, 1)), now).is_err(), "older");
+    let mut forged = record(&u, &n, 3);
+    forged.addrs.push("/ip4/1.2.3.4/tcp/1".into());
+    assert!(c.offer(&WEIRDNET, Entry::Record(forged), now).is_err(), "tampered");
+    assert!(matches!(c.lookup(&WEIRDNET, &u.id, now), Lookup::Found(r) if r.seq == 2));
+    for _ in 0..3 {
+        let (v, m) = (user(), Keypair::generate_ed25519());
+        c.offer(&WEIRDNET, Entry::Record(record(&v, &m, 1)), now).unwrap();
+    }
+    assert_eq!(c.len(), 2);
+}

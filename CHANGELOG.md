@@ -27,6 +27,8 @@ All notable changes to weirdnet-net are listed here. The format follows
 - Presenting a membership on a stream, checked against the sending node.
 - Requests to join: signed requests, approvals and denials, rate limits and a host queue.
 - A multi-host network harness in CI: NAT hole punching, relays, QUIC, mDNS and AutoNAT.
+- Locator records for private sites: sealed, signed by a locator key, under a daily DHT key.
+- EntryCache for peer records pushed to trusted peers.
 
 ### Fixed
 

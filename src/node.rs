@@ -290,6 +290,8 @@ enum Cmd<Q, R> {
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
     Provide { key: Vec<u8>, reply: oneshot::Sender<Result<()>> },
+    PutLocator { rec: crate::locator::LocatorRecord, reply: oneshot::Sender<Result<()>> },
+    GetLocators { key: Vec<u8>, reply: oneshot::Sender<Result<Vec<crate::locator::LocatorRecord>>> },
     StopProviding { key: Vec<u8> },
     Providers { key: Vec<u8>, reply: oneshot::Sender<Result<Vec<PeerId>>> },
     Stop,
@@ -570,6 +572,21 @@ impl<Q: Message, R: Message> Node<Q, R> {
     /// Records belong in the DHT only while the device hosts something public or private.
     pub fn put_entry(&self, entry: Entry) -> Result<()> {
         self.call(|reply| Cmd::PutEntry { entry, reply }, Duration::from_secs(40))
+    }
+
+    /// Put a private site's locator record in the DHT (checked first, as storing nodes do).
+    pub fn put_locator(&self, rec: crate::locator::LocatorRecord) -> Result<()> {
+        self.call(|reply| Cmd::PutLocator { rec, reply }, Duration::from_secs(40))
+    }
+
+    /// The locator records the DHT holds for `locator` today and yesterday (checked but not
+    /// opened; see [`LocatorKeys::open`](crate::locator::LocatorKeys::open)).
+    pub fn get_locators(&self, locator: &crate::PublicKey) -> Result<Vec<crate::locator::LocatorRecord>> {
+        let mut out = vec![];
+        for key in crate::locator::lookup_keys(locator, crate::now_ms()) {
+            out.extend(self.call(|reply| Cmd::GetLocators { key, reply }, Duration::from_secs(40))?);
+        }
+        Ok(out)
     }
 
     /// Every entry the DHT returns for a user (unchecked; see [`Profile::newest`]).
@@ -895,6 +912,7 @@ fn dns_config(servers: &[std::net::SocketAddr]) -> (libp2p::dns::ResolverConfig,
 pub(crate) type Opener = Arc<dyn Fn(PeerId, Vec<Multiaddr>) -> futures::future::BoxFuture<'static, Result<Stream>> + Send + Sync>;
 
 /// A DHT lookup collecting entries, and who waits for them.
+type Locating = (Vec<crate::locator::LocatorRecord>, oneshot::Sender<Result<Vec<crate::locator::LocatorRecord>>>);
 type Gathering = (Vec<Entry>, oneshot::Sender<Result<Vec<Entry>>>);
 /// A DHT search for one peer's addresses.
 type Finding = (PeerId, oneshot::Sender<Result<Vec<Multiaddr>>>);
@@ -921,6 +939,7 @@ struct Loop<Q: Message, R: Message> {
     gets: HashMap<kad::QueryId, Gathering>,
     finds: HashMap<kad::QueryId, Finding>,
     provs: HashMap<kad::QueryId, Providing>,
+    lgets: HashMap<kad::QueryId, Locating>,
     addr_book: HashMap<PeerId, Vec<Multiaddr>>,
     /// What connected peers say they listen on (identify), for provider records without addresses.
     heard: HashMap<PeerId, Vec<Multiaddr>>,
@@ -986,6 +1005,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             gets: HashMap::new(),
             finds: HashMap::new(),
             provs: HashMap::new(),
+            lgets: HashMap::new(),
             addr_book: HashMap::new(),
             heard: HashMap::new(),
             deferred: vec![],
@@ -1320,6 +1340,35 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                 }
             }
+            Cmd::PutLocator { rec, reply } => {
+                let now = crate::now_ms();
+                let key = match rec.key() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        return;
+                    }
+                };
+                let rkey = kad::RecordKey::new(&key);
+                let existing =
+                    self.swarm.behaviour_mut().kad.store_mut().get(&rkey).and_then(|r| crate::locator::LocatorRecord::decode(&r.value).ok());
+                if let Err(e) = crate::locator::accept_locator(&key, existing.as_ref(), &rec, now) {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                match self.swarm.behaviour_mut().kad.put_record(locator_record_of(rkey, &rec), kad::Quorum::One) {
+                    Ok(q) => {
+                        self.puts.insert(q, reply);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(net_err(e)));
+                    }
+                }
+            }
+            Cmd::GetLocators { key, reply } => {
+                let q = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&key));
+                self.lgets.insert(q, (vec![], reply));
+            }
             Cmd::GetEntries { user, reply } => {
                 let q = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&self.profile.record_key(&user)));
                 self.gets.insert(q, (vec![], reply));
@@ -1604,8 +1653,15 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             }
             BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetRecord(r), step, .. }) => {
+                let now = crate::now_ms();
                 let done = match r {
                     Ok(kad::GetRecordOk::FoundRecord(pr)) => {
+                        if let Some((v, _)) = self.lgets.get_mut(&id)
+                            && let Ok(l) = crate::locator::LocatorRecord::decode(&pr.record.value)
+                            && crate::locator::accept_locator(pr.record.key.as_ref(), None, &l, now).is_ok()
+                        {
+                            v.push(l);
+                        }
                         if let Some((v, _)) = self.gets.get_mut(&id)
                             && let Ok(e) = Entry::decode(&pr.record.value)
                         {
@@ -1615,6 +1671,12 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     }
                     _ => true,
                 };
+                if done && let Some((v, tx)) = self.lgets.remove(&id) {
+                    let _ = tx.send(Ok(v));
+                    if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&id) {
+                        q.finish();
+                    }
+                }
                 if done && let Some((v, tx)) = self.gets.remove(&id) {
                     let _ = tx.send(Ok(v));
                     if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&id) {
@@ -1751,11 +1813,36 @@ fn record_of(key: kad::RecordKey, entry: &Entry) -> kad::Record {
     rec
 }
 
+/// A Kademlia record holding a locator record, expiring with it.
+fn locator_record_of(key: kad::RecordKey, l: &crate::locator::LocatorRecord) -> kad::Record {
+    let mut rec = kad::Record::new(key, l.encode());
+    let left = (l.expires - crate::now_ms()).max(0) as u64;
+    rec.expires = Some(std::time::Instant::now() + Duration::from_millis(left));
+    rec
+}
+
 impl<Q: Message, R: Message> Loop<Q, R> {
+    /// A peer put a locator record: keep it only if it checks out under its key.
+    fn inbound_locator(&mut self, rec: kad::Record, l: crate::locator::LocatorRecord, source: PeerId) {
+        let store = self.swarm.behaviour_mut().kad.store_mut();
+        let existing = store.get(&rec.key).and_then(|r| crate::locator::LocatorRecord::decode(&r.value).ok());
+        match crate::locator::accept_locator(rec.key.as_ref(), existing.as_ref(), &l, crate::now_ms()) {
+            Ok(()) => {
+                let mut r = locator_record_of(rec.key.clone(), &l);
+                r.publisher = rec.publisher;
+                let _ = store.put(r);
+            }
+            Err(e) => tracing::debug!("network: refused a locator record from {source}: {e}"),
+        }
+    }
+
     /// A peer put a record: keep it only if it is a valid names entry under its own key
     /// that supersedes what we hold (see [`Profile::accept`]).
     fn inbound_put(&mut self, rec: kad::Record, source: PeerId) {
         let Ok(entry) = Entry::decode(&rec.value) else {
+            if let Ok(l) = crate::locator::LocatorRecord::decode(&rec.value) {
+                return self.inbound_locator(rec, l, source);
+            }
             tracing::debug!("network: refused a DHT record from {source}: not a names entry");
             return;
         };

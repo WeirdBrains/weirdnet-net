@@ -88,7 +88,15 @@ response types, its own storage and its own policy; the crate brings the wire.
   under `SHA-256("weirdnet/peer/" + user id)` (`put_entry`, `get_entries`), where every
   storing node runs `Profile::accept`: valid signature, unrevoked certificate, unexpired,
   higher `seq` wins. `_weirdnet.<name> TXT "v=1 user=<id>"` binds a domain to a user
-  (`binding_txt`, `parse_binding`).
+  (`binding_txt`, `parse_binding`). `EntryCache` is what a trusted peer keeps of records
+  pushed to it, by the same rule.
+- `locator`: private sites found only by those trusted with them. A site's `LocatorKeys`
+  (an Ed25519 locator key and a secret) seal its peer record into a `LocatorRecord` under a
+  DHT key that changes every UTC day (`SHA-256("weirdnet/locator/v1" ‖ key ‖ day)`), signed
+  by the locator key, never the user key. Storing nodes check the signature, the day, the
+  expiry and `seq` and learn nothing about the owner, the site or the addresses
+  (`Node::put_locator`); holders of the keys fetch today's and yesterday's
+  (`Node::get_locators`) and open them (`LocatorKeys::open`, `newest_open`).
 - `exchange`: signed offers and answers (Ed25519 node keys, fresh X25519 keys), the derived
   exchange key, a ten-digit short code and a fingerprint to compare out of band, tokens and
   links (invitations), scopes with an expiry, and sealed messages bound to the exchange and

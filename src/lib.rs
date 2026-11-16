@@ -8,6 +8,7 @@ pub mod identity;
 pub mod ingress;
 pub mod invite;
 pub mod join;
+pub mod locator;
 pub mod member;
 pub mod names;
 pub mod node;
