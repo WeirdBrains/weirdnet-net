@@ -25,7 +25,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, mdns, noise, ping, relay, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, mdns, noise, ping, relay, yamux};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -393,20 +393,8 @@ fn build_swarm<Q: Message, R: Message>(p: &'static Profile, key: Keypair, cfg: &
         wss_tls.config()?;
         libp2p::SwarmBuilder::with_existing_identity(key)
             .with_tokio()
-            .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
+            .with_other_transport(|key| crate::wss::transport(key, &wss_tls, dns))
             .map_err(net_err)?
-            .with_quic()
-            .with_other_transport(|key| -> std::result::Result<_, BoxErr> {
-                let mut ws = libp2p::websocket::Config::new(tcp::tokio::Transport::new(tcp::Config::default().nodelay(true)));
-                ws.set_tls_config(wss_tls.config()?);
-                Ok(ws
-                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-                    .authenticate(noise::Config::new(key)?)
-                    .multiplex(yamux::Config::default())
-                    .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m))))
-            })
-            .map_err(net_err)?
-            .with_dns_config(dns.0, dns.1)
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(net_err)?
             .with_behaviour(move |key, relay| behaviour(p, key, relay, &cfg2).map_err(|e| Box::new(e) as BoxErr))

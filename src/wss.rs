@@ -58,3 +58,102 @@ pub fn is_wss(a: &libp2p::Multiaddr) -> bool {
     let v: Vec<Protocol> = a.iter().collect();
     v.iter().any(|p| matches!(p, Protocol::Wss(_))) || v.windows(2).any(|w| matches!(w[0], Protocol::Tls) && matches!(w[1], Protocol::Ws(_)))
 }
+
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// TCP, QUIC and WebSocket over TLS (each with Noise and Yamux, QUIC with its own TLS) under
+/// DNS resolution. DNS names in WSS addresses are kept as the TLS server name (`/tls/sni/…`)
+/// before they are resolved, so certificates are checked against the name, not the IP.
+pub(crate) fn transport(
+    key: &libp2p::identity::Keypair,
+    tls: &WssTls,
+    dns: (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts),
+) -> std::result::Result<libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>, BoxErr> {
+    use libp2p::core::muxing::StreamMuxerBox;
+    use libp2p::core::upgrade::Version;
+    use libp2p::{Transport, noise, quic, tcp, yamux};
+    let tcp_cfg = || tcp::Config::default().nodelay(true);
+    let tcp = tcp::tokio::Transport::new(tcp_cfg())
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(key)?)
+        .multiplex(yamux::Config::default())
+        .map(|(p, m), _| (p, StreamMuxerBox::new(m)));
+    let quic = quic::tokio::Transport::new(quic::Config::new(key)).map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+    let mut ws = libp2p::websocket::Config::new(tcp::tokio::Transport::new(tcp_cfg()));
+    ws.set_tls_config(tls.config()?);
+    let ws = ws
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(key)?)
+        .multiplex(yamux::Config::default())
+        .map(|(p, m), _| (p, StreamMuxerBox::new(m)));
+    let all = ws.or_transport(quic).map(|e, _| e.into_inner()).or_transport(tcp).map(|e, _| e.into_inner());
+    let dns = libp2p::dns::tokio::Transport::custom(all, dns.0, dns.1);
+    Ok(SniFirst(dns).boxed())
+}
+
+/// Adds `/sni/<name>` to WSS addresses dialed by DNS name (see [`with_sni`]).
+struct SniFirst<T>(T);
+
+impl<T: libp2p::core::Transport + Unpin> libp2p::core::Transport for SniFirst<T> {
+    type Output = T::Output;
+    type Error = T::Error;
+    type ListenerUpgrade = T::ListenerUpgrade;
+    type Dial = T::Dial;
+
+    fn listen_on(
+        &mut self,
+        id: libp2p::core::transport::ListenerId,
+        addr: libp2p::Multiaddr,
+    ) -> std::result::Result<(), libp2p::core::transport::TransportError<Self::Error>> {
+        self.0.listen_on(id, addr)
+    }
+
+    fn remove_listener(&mut self, id: libp2p::core::transport::ListenerId) -> bool {
+        self.0.remove_listener(id)
+    }
+
+    fn dial(
+        &mut self,
+        addr: libp2p::Multiaddr,
+        opts: libp2p::core::transport::DialOpts,
+    ) -> std::result::Result<Self::Dial, libp2p::core::transport::TransportError<Self::Error>> {
+        self.0.dial(with_sni(&addr), opts)
+    }
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::core::transport::TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// `/dns…/<name>/tcp/<port>/tls/ws` (or `/wss`) becomes `…/tls/sni/<name>/ws`, so the name
+/// survives DNS resolution as the TLS server name. Other addresses are left alone.
+pub fn with_sni(a: &libp2p::Multiaddr) -> libp2p::Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let v: Vec<Protocol> = a.iter().collect();
+    let mut out = libp2p::Multiaddr::empty();
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i] {
+            Protocol::Dns(n) | Protocol::Dns4(n) | Protocol::Dns6(n) => {
+                name = Some(n.to_string());
+                out.push(v[i].clone());
+            }
+            Protocol::Tls if name.is_some() && matches!(v.get(i + 1), Some(Protocol::Ws(_))) => {
+                out.push(Protocol::Tls);
+                out.push(Protocol::Sni(name.take().unwrap_or_default().into()));
+            }
+            Protocol::Wss(path) if name.is_some() => {
+                out.push(Protocol::Tls);
+                out.push(Protocol::Sni(name.take().unwrap_or_default().into()));
+                out.push(Protocol::Ws(path.clone()));
+            }
+            p => out.push(p.clone()),
+        }
+        i += 1;
+    }
+    out
+}
