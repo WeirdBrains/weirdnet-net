@@ -6,6 +6,8 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-16
+
 ### Added
 
 - Locator records for private sites: sealed, signed by a locator key, under a daily DHT key.
@@ -65,6 +67,7 @@ All notable changes to weirdnet-net are listed here. The format follows
 - First release, extracted from Muninn: the Weirdnet libp2p node with identities, Kademlia,
   relays, hole punching and request-response protocols.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WeirdBrains/weirdnet-net/releases/tag/v0.2.0
