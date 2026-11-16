@@ -62,7 +62,7 @@ pub struct NodeConfig {
 /// Limits of the relay server: how many reservations and circuits it holds, and how long
 /// and how much one circuit may carry. [`RelayLimits::default`] keeps libp2p's defaults
 /// (circuits for hole punching and small requests: 2 minutes, 128 KiB);
-/// [`RelayLimits::data`] lets circuits carry data.
+/// [`RelayLimits::unlimited`] caps nothing, so circuits carry data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayLimits {
     /// Reservations held at once, and per peer.
@@ -77,6 +77,8 @@ pub struct RelayLimits {
     pub max_circuit_duration: Duration,
     /// How many bytes one circuit may carry in each direction; 0: no limit.
     pub max_circuit_bytes: u64,
+    /// libp2p's rate limiters on new reservations and circuits (per peer and per IP).
+    pub rate_limits: bool,
 }
 
 impl Default for RelayLimits {
@@ -91,6 +93,7 @@ impl Default for RelayLimits {
             max_circuits_per_peer: c.max_circuits_per_peer,
             max_circuit_duration: c.max_circuit_duration,
             max_circuit_bytes: c.max_circuit_bytes,
+            rate_limits: true,
         }
     }
 }
@@ -99,18 +102,25 @@ impl RelayLimits {
     /// Longest circuit duration libp2p accepts.
     pub const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(u32::MAX as u64);
 
-    /// Circuits that carry data: no byte limit, a day per circuit, and room for more
-    /// reservations (1024, 8 per peer) and circuits (1024, 16 per peer).
-    pub fn data() -> Self {
+    /// No caps: as many reservations and circuits as clients ask for, no byte limit, the
+    /// longest circuit libp2p accepts, and no rate limiters. Reservations still last an hour
+    /// before the client renews them.
+    pub fn unlimited() -> Self {
         RelayLimits {
-            max_reservations: 1024,
-            max_reservations_per_peer: 8,
-            max_circuits: 1024,
-            max_circuits_per_peer: 16,
-            max_circuit_duration: Duration::from_secs(24 * 3600),
+            max_reservations: usize::MAX,
+            max_reservations_per_peer: usize::MAX,
+            max_circuits: usize::MAX,
+            max_circuits_per_peer: usize::MAX,
+            max_circuit_duration: Self::MAX_CIRCUIT_DURATION,
             max_circuit_bytes: 0,
+            rate_limits: false,
             ..Self::default()
         }
+    }
+
+    /// Whether nothing is capped (see [`RelayLimits::unlimited`]).
+    pub fn is_unlimited(&self) -> bool {
+        *self == Self::unlimited()
     }
 
     /// Refuse limits libp2p cannot apply (a zero count or duration, or a circuit duration
@@ -129,7 +139,7 @@ impl RelayLimits {
     }
 
     fn config(&self) -> relay::Config {
-        relay::Config {
+        let mut c = relay::Config {
             max_reservations: self.max_reservations,
             max_reservations_per_peer: self.max_reservations_per_peer,
             reservation_duration: self.reservation_duration,
@@ -138,7 +148,12 @@ impl RelayLimits {
             max_circuit_duration: self.max_circuit_duration,
             max_circuit_bytes: self.max_circuit_bytes,
             ..relay::Config::default()
+        };
+        if !self.rate_limits {
+            c.reservation_rate_limiters.clear();
+            c.circuit_src_rate_limiters.clear();
         }
+        c
     }
 }
 

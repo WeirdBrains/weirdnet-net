@@ -54,9 +54,9 @@ fn default_relay_limits_are_libp2ps() {
     assert_eq!((d.max_circuit_duration, d.max_circuit_bytes), (Duration::from_secs(120), 1 << 17));
     assert_eq!((d.max_reservations, d.max_circuits), (128, 16));
     assert!(d.check().is_ok());
-    let data = RelayLimits::data();
-    assert_eq!(data.max_circuit_bytes, 0);
-    assert!(data.check().is_ok());
+    let u = RelayLimits::unlimited();
+    assert_eq!((u.max_circuit_bytes, u.max_circuit_duration), (0, RelayLimits::MAX_CIRCUIT_DURATION));
+    assert!(u.check().is_ok() && u.is_unlimited() && !d.is_unlimited());
 }
 
 #[test]
@@ -87,8 +87,8 @@ fn small_answers_cross_a_default_relay_and_large_ones_do_not() {
 }
 
 #[test]
-fn a_data_relay_carries_large_answers() {
-    let (_relay, b, a, circuit) = line_up(RelayLimits::data());
+fn an_unlimited_relay_carries_large_answers() {
+    let (_relay, b, a, circuit) = line_up(RelayLimits::unlimited());
     for _ in 0..2 {
         match a.request(b.peer_id(), std::slice::from_ref(&circuit), Q::Get(2 * 1024 * 1024)).unwrap() {
             R::Blob(v) => assert_eq!(v.len(), 2 * 1024 * 1024),

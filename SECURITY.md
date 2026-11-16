@@ -43,11 +43,11 @@ What the crate leaves to the application:
   exchange); that is by design and only for the user's own nodes.
 
 Tested over libp2p's in-memory transport (real Noise, Yamux and request-response), including
-a request answered through a relay circuit under the default and the data limits; TCP and
+a request answered through a relay circuit under the default and unlimited limits; TCP and
 QUIC sockets, hole punching, mDNS and AutoNAT are not exercised by the tests.
 
-Relay limits: `RelayLimits::data()` removes the per-circuit byte cap and allows day-long
-circuits, so a relay running it carries whatever its clients send (libp2p's per-peer and
+Relay limits: `RelayLimits::unlimited()` removes every reservation, circuit, time and byte
+cap, so a relay running it carries whatever its clients send (libp2p's per-peer and
 per-IP reservation and circuit rate limiters still apply). Bandwidth controls are the
 operator's.
 
