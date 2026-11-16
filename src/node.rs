@@ -9,6 +9,7 @@
 //! that come in are answered by a [`Handler`] on Tokio's blocking pool.
 use crate::addr::{addr_peer, circuit_relay, reach_rank, routable, shareable};
 use crate::error::{NetError, Result};
+use crate::events::{Event, Events, Hub, StatusWatch};
 use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
 use crate::profile::Profile;
 use crate::stream::transport::Control;
@@ -237,6 +238,9 @@ pub struct Status {
     pub relay_server: bool,
     pub mdns: bool,
     pub started_at: i64,
+    /// Paused by the app ([`Node::pause`]).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 // rustc 1.100 flags code the `NetworkBehaviour` derive generates (matches on
@@ -273,6 +277,9 @@ enum Cmd<Q, R> {
     Connect { peer: PeerId, addrs: Vec<Multiaddr>, reply: oneshot::Sender<Result<PeerId>> },
     DropPath { peer: PeerId, path: Path, reply: oneshot::Sender<Result<usize>> },
     Paths { peer: PeerId, reply: oneshot::Sender<Result<Vec<Path>>> },
+    Pause { reply: oneshot::Sender<Result<()>> },
+    Resume { reply: oneshot::Sender<Result<()>> },
+    NetworkChanged { reply: oneshot::Sender<Result<()>> },
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
     Stop,
@@ -287,6 +294,8 @@ pub struct Node<Q: Message, R: Message> {
     status: Arc<Mutex<Status>>,
     request_timeout: Duration,
     streams: (tokio::runtime::Handle, Control),
+    hub: Hub,
+    status_rx: tokio::sync::watch::Receiver<Status>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -410,6 +419,9 @@ impl<Q: Message, R: Message> Node<Q, R> {
         let names_list = cfg.names_servers.clone();
         let request_timeout = cfg.req_timeout();
         let (streams_tx, streams_rx) = std::sync::mpsc::channel::<(tokio::runtime::Handle, Control)>();
+        let hub = Hub::default();
+        let (status_tx, status_rx) = tokio::sync::watch::channel(status.lock().map(|s| s.clone()).unwrap_or_default());
+        let hub2 = hub.clone();
         let thread = std::thread::Builder::new()
             .name(profile.thread.into())
             .spawn(move || {
@@ -440,6 +452,8 @@ impl<Q: Message, R: Message> Node<Q, R> {
                         }
                     };
                     let mut l = Loop::new(profile, swarm, cfg, handler, st);
+                    l.hub = hub2;
+                    l.status_tx = Some(status_tx);
                     l.run(rx, ready_tx).await;
                 });
                 rt.shutdown_timeout(Duration::from_secs(2));
@@ -448,7 +462,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
         match ready_rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Ok(())) => {
                 let streams = streams_rx.recv().map_err(|_| stopped())?;
-                Ok(Node { peer_id, profile, names_list, tx, status, request_timeout, streams, thread: Some(thread) })
+                Ok(Node { peer_id, profile, names_list, tx, status, request_timeout, streams, hub, status_rx, thread: Some(thread) })
             }
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -642,6 +656,61 @@ impl<Q: Message, R: Message> Node<Q, R> {
         self.call(|reply| Cmd::DropPath { peer, path, reply }, Duration::from_secs(5))
     }
 
+    /// Events from now on (connections, listeners, reservations, NAT, lifecycle).
+    pub fn events(&self) -> Events {
+        self.hub.subscribe()
+    }
+
+    /// The status, and a way to wait for it to change.
+    pub fn watch_status(&self) -> StatusWatch {
+        StatusWatch { rx: self.status_rx.clone() }
+    }
+
+    /// The app goes to the background: close every connection and listener and give up relay
+    /// reservations. Requests and streams opened while paused still dial out.
+    pub fn pause(&self) -> Result<()> {
+        self.call(|reply| Cmd::Pause { reply }, Duration::from_secs(5))
+    }
+
+    /// Back in the foreground: listen again, reserve on the relays again, rejoin the DHT.
+    pub fn resume(&self) -> Result<()> {
+        self.call(|reply| Cmd::Resume { reply }, Duration::from_secs(5))
+    }
+
+    /// The device moved to another network (Wi-Fi to cellular, a new address): drop the
+    /// connections made on the old one and make them again. Streams carry on once a path is back.
+    pub fn network_changed(&self) -> Result<()> {
+        self.call(|reply| Cmd::NetworkChanged { reply }, Duration::from_secs(5))
+    }
+
+    /// [`Node::request`] for async callers (any executor).
+    pub async fn request_async(&self, peer: PeerId, addrs: &[Multiaddr], wire: Q) -> Result<R> {
+        let addrs = addrs.to_vec();
+        self.call_async(|reply| Cmd::Request { peer, addrs, wire, reply }, self.request_timeout + Duration::from_secs(5)).await
+    }
+
+    /// [`Node::connect`] for async callers.
+    pub async fn connect_async(&self, peer: PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        let addrs = addrs.to_vec();
+        self.call_async(|reply| Cmd::Connect { peer, addrs, reply }, Duration::from_secs(30)).await.map(|_| ())
+    }
+
+    /// [`Node::dial`] for async callers.
+    pub async fn dial_async(&self, addr: Multiaddr) -> Result<PeerId> {
+        self.call_async(|reply| Cmd::Dial { addr, reply }, Duration::from_secs(30)).await
+    }
+
+    async fn call_async<T: Send + 'static>(&self, make: impl FnOnce(oneshot::Sender<Result<T>>) -> Cmd<Q, R>, wait: Duration) -> Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(make(tx)).map_err(|_| stopped())?;
+        let rt = self.streams.0.clone();
+        rt.spawn(async move { tokio::time::timeout(wait, rx).await })
+            .await
+            .map_err(|_| stopped())?
+            .map_err(|_| NetError::Network("timed out".into()))?
+            .map_err(|_| stopped())?
+    }
+
     /// The connections to `peer` now, by kind (one entry per connection).
     pub fn paths(&self, peer: PeerId) -> Result<Vec<Path>> {
         self.call(|reply| Cmd::Paths { peer, reply }, Duration::from_secs(5))
@@ -749,6 +818,19 @@ struct Loop<Q: Message, R: Message> {
     deferred: Vec<(PeerId, std::time::Instant, Cmd<Q, R>)>,
     /// Open connections: whose, and whether through a relay.
     conns: HashMap<libp2p::swarm::ConnectionId, (PeerId, bool)>,
+    hub: Hub,
+    status_tx: Option<tokio::sync::watch::Sender<Status>>,
+    /// Listeners up now (paused nodes close them).
+    listeners: HashSet<libp2p::core::transport::ListenerId>,
+    paused: bool,
+    /// Relays whose reservation went away, and when to ask again.
+    relay_retry: Vec<(Multiaddr, std::time::Instant, Duration)>,
+    /// How long to wait before asking a relay again; reset when it accepts.
+    relay_backoff: HashMap<PeerId, Duration>,
+}
+
+fn path_of(relayed: bool) -> Path {
+    if relayed { Path::Relayed } else { Path::Direct }
 }
 
 fn endpoint_relayed(e: &libp2p::core::ConnectedPoint) -> bool {
@@ -795,12 +877,27 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             addr_book: HashMap::new(),
             deferred: vec![],
             conns: HashMap::new(),
+            hub: Hub::default(),
+            status_tx: None,
+            listeners: HashSet::new(),
+            paused: false,
+            relay_retry: vec![],
+            relay_backoff: HashMap::new(),
         }
     }
 
     fn update(&self, f: impl FnOnce(&mut Status)) {
         if let Ok(mut s) = self.status.lock() {
             f(&mut s);
+            if let Some(tx) = &self.status_tx {
+                tx.send_if_modified(|old| {
+                    let changed = *old != *s;
+                    if changed {
+                        *old = s.clone();
+                    }
+                    changed
+                });
+            }
         }
     }
 
@@ -891,6 +988,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 _ = tick.tick() => self.periodic(),
                 _ = check.tick() => {
                     self.retry_stuck_reservations();
+                    self.retry_lost_reservations();
                     self.release_deferred(None);
                 }
             }
@@ -906,6 +1004,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
     fn periodic(&mut self) {
         if let Some(n) = &self.cfg.names_server {
             n.0.prune(crate::now_ms());
+        }
+        if self.paused {
+            return;
         }
         let k = &mut self.swarm.behaviour_mut().kad;
         // With an empty routing table there is no one to bootstrap from; asking
@@ -940,6 +1041,82 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 tracing::warn!("network: cannot listen through relay {circuit}: {e}");
                 self.relay_listening.remove(&peer);
             }
+        }
+    }
+
+    /// A relay's circuit listener closed (its connection went away, or we paused): the
+    /// reservation is gone; ask again later unless paused.
+    fn relay_listener_closed(&mut self, id: libp2p::core::transport::ListenerId) {
+        let Some(relay) = self.relay_listeners.iter().find(|(_, (_, l, _))| *l == id).map(|(p, _)| *p) else { return };
+        let Some((mut circuit, _, _)) = self.relay_listeners.remove(&relay) else { return };
+        self.relay_listening.remove(&relay);
+        let r = relay.to_string();
+        self.update(|s| s.reservations.retain(|x| *x != r));
+        self.hub.send(Event::ReservationLost { relay });
+        circuit.pop();
+        if !self.paused {
+            let wait = self.relay_backoff.get(&relay).copied().unwrap_or(Duration::from_secs(1));
+            self.relay_backoff.insert(relay, (wait * 2).min(Duration::from_secs(60)));
+            self.relay_retry.retain(|(a, _, _)| *a != circuit);
+            self.relay_retry.push((circuit, std::time::Instant::now() + wait, wait));
+        }
+    }
+
+    fn retry_lost_reservations(&mut self) {
+        if self.paused {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.relay_retry).into_iter().partition(|(_, at, _)| *at <= now);
+        self.relay_retry = keep;
+        for (addr, _, wait) in due {
+            let peer = addr_peer(&addr);
+            self.add_relay(addr.clone());
+            // not listening through it (couldn't ask): try again, backing off to a minute
+            if peer.is_some_and(|p| !self.relay_listening.contains(&p)) {
+                let wait = (wait * 2).min(Duration::from_secs(60));
+                self.relay_retry.push((addr, now + wait, wait));
+            }
+        }
+    }
+
+    /// Close every connection and listener (relay circuits too).
+    fn go_quiet(&mut self) {
+        for id in self.listeners.clone() {
+            self.swarm.remove_listener(id);
+        }
+        for (_, (_, id, _)) in self.relay_listeners.clone() {
+            self.swarm.remove_listener(id);
+        }
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        for p in peers {
+            let _ = self.swarm.disconnect_peer_id(p);
+        }
+    }
+
+    /// Listen, reserve and bootstrap again.
+    fn wake(&mut self, listen: bool) {
+        if listen {
+            for a in self.cfg.listen.clone() {
+                if let Err(e) = self.swarm.listen_on(a.clone()) {
+                    tracing::warn!("network: cannot listen on {a}: {e}");
+                }
+            }
+        }
+        let relays: Vec<Multiaddr> = self.cfg.relays.iter().cloned().chain(self.relay_retry.drain(..).map(|(a, _, _)| a)).collect();
+        for r in relays {
+            self.add_relay(r);
+        }
+        for b in self.cfg.bootstrap.clone() {
+            if let Some(p) = addr_peer(&b)
+                && !self.relay_listening.contains(&p)
+            {
+                let _ = self.swarm.dial(b);
+            }
+        }
+        let k = &mut self.swarm.behaviour_mut().kad;
+        if !routing_empty(k) {
+            let _ = k.bootstrap();
         }
     }
 
@@ -1074,6 +1251,48 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 let n = ids.iter().filter(|c| self.swarm.close_connection(**c)).count();
                 let _ = reply.send(Ok(n));
             }
+            Cmd::Pause { reply } => {
+                if !self.paused {
+                    self.paused = true;
+                    // relays to come back to
+                    let mut back: Vec<Multiaddr> = self
+                        .relay_listeners
+                        .values()
+                        .map(|(c, _, _)| {
+                            let mut c = c.clone();
+                            c.pop();
+                            c
+                        })
+                        .collect();
+                    back.extend(self.relay_retry.drain(..).map(|(a, _, _)| a));
+                    self.go_quiet();
+                    let now = std::time::Instant::now();
+                    self.relay_retry = back.into_iter().map(|a| (a, now, Duration::from_secs(1))).collect();
+                    self.update(|s| s.paused = true);
+                    self.hub.send(Event::Paused);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::Resume { reply } => {
+                if self.paused {
+                    self.paused = false;
+                    self.update(|s| s.paused = false);
+                    self.wake(true);
+                    self.hub.send(Event::Resumed);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::NetworkChanged { reply } => {
+                if !self.paused {
+                    let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+                    for p in peers {
+                        let _ = self.swarm.disconnect_peer_id(p);
+                    }
+                    self.wake(false);
+                }
+                self.hub.send(Event::NetworkChanged);
+                let _ = reply.send(Ok(()));
+            }
             Cmd::Paths { peer, reply } => {
                 let v = self.conns.values().filter(|(p, _)| *p == peer).map(|(_, r)| if *r { Path::Relayed } else { Path::Direct }).collect();
                 let _ = reply.send(Ok(v));
@@ -1095,6 +1314,8 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         match ev {
             SwarmEvent::NewListenAddr { listener_id, address } => {
                 tracing::info!("network: listening on {address}");
+                self.listeners.insert(listener_id);
+                self.hub.send(Event::Listening(address.clone()));
                 // a relay announces where it listens: reservations carry those addresses
                 if self.cfg.relay_server && self.cfg.external.is_empty() && routable(&address) && !address.iter().any(|p| p == Protocol::P2pCircuit) {
                     self.swarm.add_external_address(address.clone());
@@ -1104,23 +1325,39 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 self.refresh();
             }
-            SwarmEvent::ListenerClosed { listener_id, .. } => {
+            SwarmEvent::ListenerClosed { listener_id, addresses, .. } => {
+                self.listeners.remove(&listener_id);
+                for a in addresses {
+                    self.hub.send(Event::ListenClosed(a));
+                }
                 if let Some(tx) = self.listens.remove(&listener_id) {
                     let _ = tx.send(Err(NetError::Network("listener closed".into())));
                 }
+                self.relay_listener_closed(listener_id);
                 self.refresh();
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
                 // a relay keeps to its configured addresses (or at least routable ones)
                 if self.cfg.relay_server && (!routable(&address) || (!self.cfg.external.is_empty() && !self.cfg.external.contains(&address))) {
                     self.swarm.remove_external_address(&address);
+                } else {
+                    self.hub.send(Event::External { addr: address, confirmed: true });
                 }
                 self.refresh()
             }
-            SwarmEvent::ExternalAddrExpired { .. } | SwarmEvent::ExpiredListenAddr { .. } => self.refresh(),
+            SwarmEvent::ExternalAddrExpired { address } => {
+                self.hub.send(Event::External { addr: address, confirmed: false });
+                self.refresh()
+            }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.hub.send(Event::ListenClosed(address));
+                self.refresh()
+            }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                 self.release_deferred(Some(peer_id));
-                self.conns.insert(connection_id, (peer_id, endpoint_relayed(&endpoint)));
+                let relayed = endpoint_relayed(&endpoint);
+                self.conns.insert(connection_id, (peer_id, relayed));
+                self.hub.send(Event::Connected { peer: peer_id, path: path_of(relayed) });
                 let addr = endpoint.get_remote_address().clone();
                 if endpoint.is_dialer() {
                     let a = if addr_peer(&addr) == Some(peer_id) { addr.clone() } else { addr.clone().with(Protocol::P2p(peer_id)) };
@@ -1141,8 +1378,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 self.refresh();
             }
-            SwarmEvent::ConnectionClosed { connection_id, .. } => {
-                self.conns.remove(&connection_id);
+            SwarmEvent::ConnectionClosed { connection_id, peer_id, num_established, .. } => {
+                if let Some((_, relayed)) = self.conns.remove(&connection_id) {
+                    self.hub.send(Event::Disconnected { peer: peer_id, path: path_of(relayed), remaining: num_established });
+                }
                 self.refresh()
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1276,7 +1515,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                         self.swarm.add_peer_address(p, a.clone());
                         self.swarm.behaviour_mut().kad.add_address(&p, a.clone());
                     }
-                    if !self.swarm.is_connected(&p) {
+                    if !self.paused && !self.swarm.is_connected(&p) {
                         let _ = self.swarm.dial(p);
                     }
                     self.seen(Sighting { peer: p, addrs: addrs.iter().map(|a| a.to_string()).collect(), caps: None, agent: None, source: "mdns" });
@@ -1304,6 +1543,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 let private = self.status.lock().map(|s| s.nat == "private").unwrap_or(false);
                 if is_relay
                     && private
+                    && !self.paused
                     && self.relay_listening.is_empty()
                     && let Some(a) = info.listen_addrs.iter().filter(|a| shareable(a)).min_by_key(|a| reach_rank(a))
                 {
@@ -1327,6 +1567,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     autonat::NatStatus::Unknown => "unknown",
                 };
                 self.update(|s| s.nat = nat.into());
+                self.hub.send(Event::Nat(nat.into()));
                 if nat == "private" {
                     let relays: Vec<PeerId> = self.relays.iter().copied().collect();
                     tracing::info!("network: behind NAT; {} relay(s) known", relays.len());
@@ -1334,6 +1575,8 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }) => {
                 tracing::info!("network: reservation on relay {relay_peer_id}");
+                self.hub.send(Event::Reserved { relay: relay_peer_id });
+                self.relay_backoff.remove(&relay_peer_id);
                 self.update(|s| {
                     let r = relay_peer_id.to_string();
                     if !s.reservations.contains(&r) {

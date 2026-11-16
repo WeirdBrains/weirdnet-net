@@ -28,6 +28,14 @@ response types, its own storage and its own policy; the crate brings the wire.
   moves its relayed streams there, and when a connection goes away the stream carries on over
   the path that is left (relays are kept warm while streams are open). `Stream::path`,
   `Stream::moves`, `Node::paths` and `Node::drop_path` show and steer that.
+- `events`: what the node is doing. `Node::events()` is a stream (or `next_timeout`) of
+  listeners, external addresses, connections with their path, relay reservations made and
+  lost, and the NAT verdict; `Node::watch_status()` waits for the `Status` to change. Apps
+  call `Node::pause` and `Node::resume` as they go to the background and back, and
+  `Node::network_changed` when the device changes networks. Lost reservations are asked for
+  again with backoff. `request_async`, `connect_async` and `dial_async` suit async callers on
+  any executor. CI checks Android (aarch64-linux-android) and iOS (aarch64-apple-ios) builds and
+  runs the tests on Linux, macOS and Windows.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher

@@ -12,10 +12,15 @@ All notable changes to weirdnet-net are listed here. The format follows
 - Streams move from a relay to a direct connection and back without losing data.
 - Request and response caps and the request timeout are node settings.
 - Node::connect, Node::paths and Node::drop_path.
+- An event stream and a status watch: listeners, addresses, connections, reservations and NAT changes.
+- Node::pause, Node::resume and Node::network_changed for app lifecycles and network moves.
+- Async request, connect and dial.
+- CI builds for Android and iOS and tests on macOS and Windows.
 
 ### Fixed
 
 - A request or dial through a relay no longer fails while the node is still connecting to that relay.
+- A relay reservation that is lost is asked for again.
 
 ## [0.2.0] - 2026-11-16
 

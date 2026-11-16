@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 pub mod addr;
 mod error;
+pub mod events;
 pub mod exchange;
 pub mod identity;
 pub mod invite;
@@ -14,6 +15,7 @@ pub mod sync;
 pub mod user;
 
 pub use error::{NetError, Result};
+pub use events::{Event, Events, StatusWatch};
 pub use exchange::{Answer, DEFAULT_TTL_MS, Derived, Offer, Token, normalize_code};
 pub use libp2p::identity::{Keypair, PublicKey};
 pub use libp2p::{Multiaddr, PeerId};
@@ -32,6 +34,8 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[cfg(test)]
+mod events_tests;
 #[cfg(test)]
 mod names_tests;
 #[cfg(test)]
