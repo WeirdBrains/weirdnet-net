@@ -10,6 +10,7 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 - Locator records for private sites: sealed, signed by a locator key, under a daily DHT key.
 - EntryCache for peer records pushed to trusted peers.
+- Sealed streams: stream frames sealed with the exchange key, in order, with a sealed end.
 
 ## [0.3.0] - 2026-11-16
 

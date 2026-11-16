@@ -16,6 +16,12 @@ What the crate enforces:
   peer ids in order, so a message can't be moved to another exchange or turned around.
   `sealed::serve` opens only for a known, active exchange whose peer is the sender Noise
   authenticated.
+- Sealed streams (`sealed::open_stream`, `sealed::serve_stream`) use a key per stream and
+  direction, derived from the exchange key, both sides' random nonces, the exchange id and both
+  peer ids. Each frame binds the stream id, its sequence number and its kind as associated
+  data, so frames can't be reordered, replayed, dropped, moved to another stream or turned
+  around, and a stream cut off before its sealed end is an error. The receiving side checks
+  the exchange against the Noise-authenticated peer before any data.
 - Certificates and revocations are checked against the user key; a revocation time without
   its signature fails. Cards must certify the very node that sends them.
 - Invitation automation (`invite`): a delivered offer is kept only if the node that signed

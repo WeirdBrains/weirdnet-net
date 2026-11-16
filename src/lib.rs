@@ -56,6 +56,8 @@ mod names_tests;
 #[cfg(test)]
 mod relay_tests;
 #[cfg(test)]
+mod sealed_tests;
+#[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
 mod tests;

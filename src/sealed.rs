@@ -5,6 +5,10 @@
 //! and belongs to the Noise-authenticated sender; the exchange id, both peer ids and the
 //! direction are bound as associated data. What is inside (the application's request and
 //! answer types, what each may reach) stays the application's.
+//!
+//! Sealed streams do the same for [`crate::stream`] streams of any size: [`open_stream`] on
+//! the opening side and [`serve_stream`] on the receiving side, which refuses unknown,
+//! inactive or someone else's exchanges the same way. See [`SealedStream`].
 use crate::error::{NetError, Result};
 use crate::node::{Message, Node};
 use crate::profile::Profile;
@@ -362,5 +366,136 @@ pub async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin, X: Exchanges>(
             let _ = s.close().await;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::WEIRDNET;
+    use futures::executor::block_on;
+    use futures::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Reads from fixed bytes, records writes.
+    struct Pipe {
+        r: Cursor<Vec<u8>>,
+        w: Vec<u8>,
+    }
+
+    impl AsyncRead for Pipe {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.r).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Pipe {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.w).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn pipe(read: Vec<u8>) -> Pipe {
+        Pipe { r: Cursor::new(read), w: Vec::new() }
+    }
+
+    struct Setup {
+        key: Key32,
+        a: PeerId,
+        b: PeerId,
+        id: [u8; 32],
+    }
+
+    fn setup() -> Setup {
+        Setup { key: Key32::random().unwrap(), a: PeerId::random(), b: PeerId::random(), id: [7u8; 32] }
+    }
+
+    /// The frames A sends for `msgs`, then its end.
+    fn sent(s: &Setup, msgs: &[&[u8]]) -> Vec<u8> {
+        let mut tx = SealedStream::new(&WEIRDNET, pipe(vec![]), &s.key, s.id, "ex", &s.a, &s.b).unwrap();
+        block_on(async {
+            for m in msgs {
+                tx.send(m).await.unwrap();
+            }
+            tx.finish().await.unwrap();
+        });
+        tx.inner.w
+    }
+
+    /// What B reads from `wire` (all frames to the end, or the first error).
+    fn read(s: &Setup, wire: Vec<u8>) -> Result<Vec<u8>> {
+        let mut rx = SealedStream::new(&WEIRDNET, pipe(wire), &s.key, s.id, "ex", &s.b, &s.a).unwrap();
+        block_on(rx.read_to_end()).map(|z| z.to_vec())
+    }
+
+    /// Splits the wire into frames.
+    fn frames(wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < wire.len() {
+            let n = u32::from_be_bytes(wire[i + 1..i + 5].try_into().unwrap()) as usize;
+            out.push(wire[i..i + 5 + n].to_vec());
+            i += 5 + n;
+        }
+        out
+    }
+
+    #[test]
+    fn round_trip_and_large_writes_split() {
+        let s = setup();
+        let big = vec![9u8; MAX_SEALED_FRAME * 2 + 5];
+        let wire = sent(&s, &[b"one", &big]);
+        assert_eq!(frames(&wire).len(), 1 + 3 + 1);
+        assert!(!wire.windows(3).any(|w| w == b"one"), "plaintext on the wire");
+        assert_eq!(read(&s, wire).unwrap(), [b"one".as_slice(), &big].concat());
+    }
+
+    #[test]
+    fn tampering_reordering_replay_truncation_and_reflection_fail() {
+        let s = setup();
+        let wire = sent(&s, &[b"one", b"two", b"three"]);
+        let f = frames(&wire);
+        let join = |v: &[&Vec<u8>]| v.iter().flat_map(|x| x.iter().copied()).collect::<Vec<u8>>();
+        let mut flipped = wire.clone();
+        flipped[10] ^= 1;
+        assert!(read(&s, flipped).is_err(), "tampered");
+        assert!(read(&s, join(&[&f[1], &f[0], &f[2], &f[3]])).is_err(), "reordered");
+        assert!(read(&s, join(&[&f[0], &f[0], &f[1], &f[2], &f[3]])).is_err(), "replayed");
+        let e = read(&s, join(&[&f[0], &f[1], &f[2]])).unwrap_err();
+        assert!(e.to_string().contains("truncated"), "{e}");
+        assert!(read(&s, join(&[&f[0], &f[3]])).is_err(), "a frame dropped");
+        // A's own frames fed back to A (turned around).
+        let mut me = SealedStream::new(&WEIRDNET, pipe(wire.clone()), &s.key, s.id, "ex", &s.a, &s.b).unwrap();
+        assert!(block_on(me.recv()).is_err(), "reflected");
+        // Another stream id, exchange or profile.
+        let other = Setup { id: [8u8; 32], key: s.key.clone(), ..s };
+        assert!(read(&other, wire.clone()).is_err(), "another stream");
+        let s = Setup { id: other.id, ..other };
+        let mut ex = SealedStream::new(&WEIRDNET, pipe(sent(&s, &[b"x"])), &s.key, s.id, "other", &s.b, &s.a).unwrap();
+        assert!(block_on(ex.recv()).is_err(), "another exchange");
+        // Nothing after the end; sending after finish fails.
+        let w = sent(&s, &[b"x"]);
+        let mut rx = SealedStream::new(&WEIRDNET, pipe([w.clone(), w].concat()), &s.key, s.id, "ex", &s.b, &s.a).unwrap();
+        assert_eq!(&block_on(rx.recv()).unwrap().unwrap()[..], b"x");
+        assert!(block_on(rx.recv()).unwrap().is_none());
+        assert!(block_on(rx.recv()).unwrap().is_none());
+        let mut tx = SealedStream::new(&WEIRDNET, pipe(vec![]), &s.key, s.id, "ex", &s.a, &s.b).unwrap();
+        block_on(tx.finish()).unwrap();
+        assert!(block_on(tx.send(b"late")).is_err());
+    }
+
+    #[test]
+    fn oversized_frames_are_refused_before_reading_them() {
+        let s = setup();
+        let mut wire = vec![KIND_DATA];
+        wire.extend(((MAX_SEALED_FRAME + TAG + 1) as u32).to_be_bytes());
+        assert!(read(&s, wire).unwrap_err().to_string().contains("bad frame"));
     }
 }
