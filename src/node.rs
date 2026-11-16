@@ -669,7 +669,10 @@ impl<Q: Message, R: Message> Node<Q, R> {
         let (rt, control) = &self.streams;
         let control = control.clone();
         rt.spawn(async move {
-            tokio::time::timeout(Duration::from_secs(30), rx).await.map_err(|_| NetError::Network(format!("cannot reach {peer} in time")))?.map_err(|_| stopped())??;
+            tokio::time::timeout(Duration::from_secs(30), rx)
+                .await
+                .map_err(|_| NetError::Network(format!("cannot reach {peer} in time")))?
+                .map_err(|_| stopped())??;
             crate::stream::open(control, peer, p, limits).await
         })
         .await
@@ -1066,7 +1069,8 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             }
             Cmd::DropPath { peer, path, reply } => {
-                let ids: Vec<_> = self.conns.iter().filter(|(_, (p, relayed))| *p == peer && (*relayed == (path == Path::Relayed))).map(|(c, _)| *c).collect();
+                let ids: Vec<_> =
+                    self.conns.iter().filter(|(_, (p, relayed))| *p == peer && (*relayed == (path == Path::Relayed))).map(|(c, _)| *c).collect();
                 let n = ids.iter().filter(|c| self.swarm.close_connection(**c)).count();
                 let _ = reply.send(Ok(n));
             }

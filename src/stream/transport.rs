@@ -19,6 +19,7 @@
 //! USE OR OTHER DEALINGS IN THE SOFTWARE.
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, StreamExt};
+use libp2p::PeerId;
 use libp2p::core::transport::PortUse;
 use libp2p::core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use libp2p::core::{Endpoint, Multiaddr};
@@ -30,7 +31,6 @@ use libp2p::swarm::{
     ConnectionClosed, ConnectionDenied, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, DialError, DialFailure, FromSwarm, NetworkBehaviour,
     Stream, StreamProtocol, StreamUpgradeError, SubstreamProtocol, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
-use libp2p::PeerId;
 use std::collections::{HashMap, hash_map};
 use std::convert::Infallible;
 use std::future::{Ready, ready};

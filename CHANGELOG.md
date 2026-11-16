@@ -6,6 +6,13 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Streams with no size cap, backpressure and per-protocol limits, for any number of apps' protocols on one node.
+- Streams move from a relay to a direct connection and back without losing data.
+- Request and response caps and the request timeout are node settings.
+- Node::connect, Node::paths and Node::drop_path.
+
 ### Fixed
 
 - A request or dial through a relay no longer fails while the node is still connecting to that relay.

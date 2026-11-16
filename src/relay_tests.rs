@@ -118,3 +118,13 @@ fn the_first_request_through_a_relay_waits_for_the_bootstrap_dial() {
         assert_eq!(a2.dial(circuit.clone()).unwrap(), b.peer_id());
     }
 }
+
+#[test]
+fn request_caps_come_from_the_config() {
+    let small = NodeConfig { response_max: 4096, ..mem(true) };
+    let b = Node::start(&WEIRDNET, Keypair::generate_ed25519(), small, Arc::new(Blobs)).unwrap();
+    let addr: Multiaddr = b.reachable_addrs().into_iter().find(|a| a.starts_with("/memory/")).unwrap().parse().unwrap();
+    let a = Node::start(&WEIRDNET, Keypair::generate_ed25519(), NodeConfig { response_max: 4096, ..mem(false) }, Arc::new(Blobs)).unwrap();
+    assert!(a.request(b.peer_id(), std::slice::from_ref(&addr), Q::Get(1000)).is_ok());
+    assert!(a.request(b.peer_id(), std::slice::from_ref(&addr), Q::Get(100_000)).is_err());
+}

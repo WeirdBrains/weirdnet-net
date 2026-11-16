@@ -27,6 +27,7 @@ pub(crate) mod transport;
 use futures::channel::mpsc;
 use futures::io::{ReadHalf, WriteHalf};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, SinkExt, StreamExt};
+use libp2p::swarm::ConnectionId;
 use libp2p::{PeerId, StreamProtocol};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -35,7 +36,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use libp2p::swarm::ConnectionId;
 use transport::{Control, OpenError, PathEvent, Warm};
 
 /// How streams of one protocol behave.
@@ -765,6 +765,9 @@ impl Driver {
         let idle = self.limits.idle.map(|d| self.last + d);
         let linger = done_at.map(|t| t + LINGER);
         tokio::select! {
+            // a reset comes before the end that dropping the stream also makes
+            biased;
+            _ = self.reset_rx.next() => Step::Fail("reset".into()),
             f = self.frames.next() => match f {
                 Some((g, f)) => self.frame(g, f),
                 None => Step::Go,
@@ -805,7 +808,6 @@ impl Driver {
                 }
                 Step::Go
             }
-            _ = self.reset_rx.next() => Step::Fail("reset".into()),
             _ = tick.tick() => {
                 if self.delivered > self.ack_sent && let Some(w) = self.writer.as_mut() {
                     self.ack_sent = self.delivered;

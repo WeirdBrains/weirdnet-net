@@ -15,6 +15,19 @@ response types, its own storage and its own policy; the crate brings the wire.
   Key-only dialing: `request_key(peer, …)` finds a peer by its key alone (the DHT, then
   circuits through this node's relays and names servers); `request_user(user_id, …)` looks
   the user's record up and dials it.
+  Request and response caps and the request timeout are `NodeConfig` settings
+  (`request_max`, `response_max`, `request_timeout`; 8 MiB, 256 MiB and 60 s by default).
+- `stream`: byte streams with no size cap. An application accepts its own protocol ids
+  (`Node::accept_streams("/myapp/sync/1", Limits)`) and opens them
+  (`Node::open_stream(peer, addrs, protocol, Limits)`); one node carries any number of
+  apps' protocols, and a protocol nobody accepts is refused. A `Stream` is `AsyncRead` +
+  `AsyncWrite` (any executor) and blocking `Read` + `Write`, with backpressure (a window of
+  unacknowledged bytes) and per-protocol `Limits` (window, frame size, open streams, backlog,
+  idle reset, how long to wait for a path). Streams move between paths without losing or
+  repeating a byte: when a direct connection comes up (hole punching or a dial) the opener
+  moves its relayed streams there, and when a connection goes away the stream carries on over
+  the path that is left (relays are kept warm while streams are open). `Stream::path`,
+  `Stream::moves`, `Node::paths` and `Node::drop_path` show and steer that.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher

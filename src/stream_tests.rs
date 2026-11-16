@@ -63,22 +63,19 @@ fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i * 31 % 251) as u8).collect()
 }
 
-/// Write `data` on one thread while reading the echo on another; returns what came back.
-fn round_trip(s: Stream, data: Vec<u8>, mid: impl FnOnce(&Stream) + Send + 'static) -> (Vec<u8>, Stream) {
-    let s = Arc::new(std::sync::Mutex::new(s));
-    // reads and writes on one handle: split by taking the stream out for each turn is clumsy;
-    // instead write in chunks and read back in between.
-    let mut s = Arc::try_unwrap(s).unwrap().into_inner().unwrap();
+/// Write `data` in chunks, reading the echo back in between, and call `mid` a third of the way
+/// in; returns what came back.
+fn round_trip(mut s: Stream, data: Vec<u8>, mid: impl FnOnce(&Stream)) -> (Vec<u8>, Stream) {
     let mut got = Vec::with_capacity(data.len());
     let mut buf = vec![0u8; 64 * 1024];
     let chunk = 16 * 1024;
     let mut mid = Some(mid);
     for (i, c) in data.chunks(chunk).enumerate() {
         s.write_all(c).unwrap();
-        if i == data.len() / chunk / 3 {
-            if let Some(f) = mid.take() {
-                f(&s);
-            }
+        if i == data.len() / chunk / 3
+            && let Some(f) = mid.take()
+        {
+            f(&s);
         }
         // keep the echo flowing so neither window fills
         while got.len() + 2 * chunk < (i + 1) * chunk {
@@ -180,4 +177,79 @@ fn a_reset_fails_the_peers_reads() {
     assert_eq!(&buf, b"hello");
     s.reset();
     assert!(t.read(&mut buf).is_err());
+}
+
+#[test]
+fn one_node_carries_several_apps_protocols() {
+    // Morph's and Muninn's own ids on one node, beside the profile's requests
+    let b = start(mem(true));
+    let mut morph = b.accept_streams("/weirdnet-morph/files/1", Limits::default()).unwrap();
+    let mut muninn = b.accept_streams("/muninn/sync/1", Limits::default()).unwrap();
+    let a = start(mem(false));
+    let addr = [mem_addr(&b)];
+    let mut s1 = a.open_stream(b.peer_id(), &addr, "/weirdnet-morph/files/1", Limits::default()).unwrap();
+    let mut s2 = a.open_stream(b.peer_id(), &addr, "/muninn/sync/1", Limits::default()).unwrap();
+    s1.write_all(b"morph").unwrap();
+    s2.write_all(b"muninn").unwrap();
+    assert!(matches!(a.request(b.peer_id(), &addr, Q).unwrap(), R));
+    let mut t1 = morph.accept_timeout(Duration::from_secs(10)).unwrap();
+    let mut t2 = muninn.accept_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!((t1.protocol(), t2.protocol()), ("/weirdnet-morph/files/1", "/muninn/sync/1"));
+    let (mut x, mut y) = ([0u8; 5], [0u8; 6]);
+    t1.read_exact(&mut x).unwrap();
+    t2.read_exact(&mut y).unwrap();
+    assert_eq!((&x, &y), (b"morph", b"muninn"));
+    // a protocol nobody accepts any more is refused
+    drop(morph);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(a.open_stream(b.peer_id(), &addr, "/weirdnet-morph/files/1", Limits::default()).is_err());
+}
+
+#[test]
+fn a_relayed_stream_comes_back_after_its_connection_drops() {
+    let (_relay, b, a, circuit) = line_up();
+    echo(&b, Limits::default());
+    let s = a.open_stream(b.peer_id(), std::slice::from_ref(&circuit), P, Limits::default()).unwrap();
+    let a = Arc::new(a);
+    let (a2, bp) = (a.clone(), b.peer_id());
+    let data = pattern(3 * 1024 * 1024);
+    let (got, s) = round_trip(s, data.clone(), move |s| {
+        assert!(a2.drop_path(bp, Path::Relayed).unwrap() >= 1);
+        wait_for("a new relayed path", Duration::from_secs(10), || s.moves() >= 1);
+    });
+    assert!(got == data);
+    // the new connection is whichever B address worked first (B also listens directly)
+    assert!(s.moves() >= 1);
+}
+
+#[test]
+fn a_stream_whose_peer_is_gone_fails_after_the_resume_limit() {
+    let b = start(mem(true));
+    let limits = Limits { resume: Duration::from_secs(1), ..Limits::default() };
+    let mut inc = b.accept_streams(P, limits).unwrap();
+    let a = start(mem(false));
+    let mut s = a.open_stream(b.peer_id(), &[mem_addr(&b)], P, limits).unwrap();
+    s.write_all(b"x").unwrap();
+    let mut t = inc.accept_timeout(Duration::from_secs(10)).unwrap();
+    let mut one = [0u8; 1];
+    t.read_exact(&mut one).unwrap();
+    let at = Instant::now();
+    a.stop();
+    assert!(t.read(&mut one).is_err());
+    assert!(at.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn an_idle_stream_is_reset() {
+    let b = start(mem(true));
+    let limits = Limits { idle: Some(Duration::from_millis(300)), ..Limits::default() };
+    let mut inc = b.accept_streams(P, limits).unwrap();
+    let a = start(mem(false));
+    let mut s = a.open_stream(b.peer_id(), &[mem_addr(&b)], P, limits).unwrap();
+    s.write_all(b"x").unwrap();
+    let mut t = inc.accept_timeout(Duration::from_secs(10)).unwrap();
+    let mut one = [0u8; 1];
+    t.read_exact(&mut one).unwrap();
+    assert!(t.read(&mut one).is_err());
+    assert!(s.read(&mut one).is_err());
 }
