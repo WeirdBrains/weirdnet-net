@@ -6,6 +6,19 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- App calls: Node::serve_app, Node::resolve_app and Node::app_call, with streamed bodies on `/weirdnet/app/1`.
+- AppError, AppRequest, AppResponse, AppBody and AppHandler.
+- Peers announce the apps they serve through identify; Node::peer_apps reads them.
+- `app_header_max`, `app_body_max` and `app_idle_timeout` node settings.
+- An app call example.
+
+### Changed
+
+- add_relay dials every address of a relay at once and reserves on the first that connects.
+- A node that serves an app keeps its relay reservations while paused.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added

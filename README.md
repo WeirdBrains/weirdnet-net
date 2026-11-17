@@ -28,6 +28,24 @@ response types, its own storage and its own policy; the crate brings the wire.
   moves its relayed streams there, and when a connection goes away the stream carries on over
   the path that is left (relays are kept warm while streams are open). `Stream::path`,
   `Stream::moves`, `Node::paths` and `Node::drop_path` show and steer that.
+- `app`: app calls, HTTP-like requests between nodes with streamed bodies (Morph's
+  `weirdnet-<app>://` URLs). A node serves an app with `Node::serve_app("notes", handler)`
+  (an `AppHandler`, or a closure `|peer, AppRequest| async { Ok(AppResponse) }`) and peers
+  learn through identify which apps it serves (`Node::peer_apps`). A caller finds the peers
+  serving an app for a peer id, a user id or a name bound by `_weirdnet.<name>` TXT
+  (`Node::resolve_app(app, locator)`: names servers, then the DHT), and calls one with
+  `Node::app_call(peer, AppRequest, timeout)`: directly or by hole punching first, then
+  through the relay circuits in the peer's record. One stream per call on `/weirdnet/app/1`:
+  a CBOR head (`v`, `app`, `method`, `path`, `headers`, varint-length-prefixed), body frames
+  ending with an empty one, and a CBOR response head (`status` and `headers`, or `error` and
+  `message`). Bodies stream both ways with backpressure and no size cap unless
+  `NodeConfig::app_body_max` sets one; heads are capped at `app_header_max` (16 KiB) and a
+  call that goes `app_idle_timeout` (60 s) without a byte ends. Dropping the call or the
+  response body resets the stream, which stops the server's handler. Errors are `AppError`:
+  `NotFound`, `NoHandler`, `Unreachable`, `TimedOut`, `Refused`, `TooLarge`, `Protocol`. A node
+  that serves an app keeps its relay reservations, even paused, and `add_relay` dials every
+  address of a relay at once (TCP, QUIC, WSS) and reserves on whichever connects.
+  `examples/app_call.rs` serves and calls an app over TCP.
 - `events`: what the node is doing. `Node::events()` is a stream (or `next_timeout`) of
   listeners, external addresses, connections with their path, relay reservations made and
   lost, and the NAT verdict; `Node::watch_status()` waits for the `Status` to change. Apps

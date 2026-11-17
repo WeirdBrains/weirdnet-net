@@ -9,11 +9,35 @@
 //! - the server answers with CBOR `{v: 1, status, headers}` the same way, then the response
 //!   body frames and a zero-length frame; on an error, CBOR `{v: 1, error, message}` takes
 //!   the place of the response head (`error` is an [`AppError::code`]);
-//! - either side cancels by closing or resetting the stream.
+//! - either side cancels by closing or resetting the stream. The zero-length frame ends a
+//!   body, so the caller never half-closes: when it drops a call the stream is reset and the
+//!   server's handler and body stop. The server closes its side after its last frame.
+//!
+//! Frames this crate writes are at most [`WRITE_FRAME`] bytes; it reads frames up to
+//! [`MAX_FRAME`]. The caps come from [`NodeConfig`](crate::NodeConfig): `app_header_max`
+//! (16 KiB by default) for each head, `app_body_max` (none by default) for each body, and
+//! `app_idle_timeout` (60 s by default), how long a call may go without a byte. There are no
+//! rate or bandwidth limits; relays forward the bytes under their own circuit limits.
 //!
 //! A node serving app `X` also accepts `/weirdnet/app/1/X`, so identify tells peers which
-//! apps it serves (`app:X` in a [`Sighting`](crate::Sighting)'s caps); nothing is ever sent on
-//! that protocol.
+//! apps it serves (`app:X` in a [`Sighting`](crate::Sighting)'s caps, and
+//! [`Node::peer_apps`](crate::Node::peer_apps)); nothing is ever sent on that protocol.
+//!
+//! ```no_run
+//! use std::{sync::Arc, time::Duration};
+//! use weirdnet_net::{AppRequest, AppResponse, Node, PeerId};
+//! # fn demo(server: &Node<(), ()>, client: &Node<(), ()>, user_id: &str) -> Result<(), weirdnet_net::AppError> {
+//! server.serve_app("notes", Arc::new(|peer: PeerId, req: AppRequest| async move {
+//!     let body = req.body.collect().await?; // or read it chunk by chunk
+//!     Ok(AppResponse::new(200).header("content-type", "text/plain").body(format!("{peer} sent {} bytes", body.len())))
+//! }))?;
+//!
+//! let peers = client.resolve_app("notes", user_id)?; // a peer id, user id or bound name
+//! let req = AppRequest::new("notes", "POST", "/inbox?draft=1").header("content-type", "text/plain").body("hello");
+//! let resp = futures::executor::block_on(client.app_call(peers[0].0, req, Duration::from_secs(30)))?;
+//! let text = futures::executor::block_on(resp.body.collect())?;
+//! # Ok(()) }
+//! ```
 use crate::stream::transport::{Control, OpenError};
 use futures::channel::mpsc;
 use futures::io::{ReadHalf, WriteHalf};
