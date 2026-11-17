@@ -450,11 +450,15 @@ mod stream_tests {
     #[test]
     fn round_trip_and_large_writes_split() {
         let s = setup();
+        // A short marker like b"one" can appear by chance in ~128 KiB of
+        // ciphertext (about once in a hundred runs). A longer unique prefix
+        // keeps this a real sealed-wire check.
+        let marker = b"one-must-not-appear-in-the-clear";
         let big = vec![9u8; MAX_SEALED_FRAME * 2 + 5];
-        let wire = sent(&s, &[b"one", &big]);
+        let wire = sent(&s, &[marker, &big]);
         assert_eq!(frames(&wire).len(), 1 + 3 + 1);
-        assert!(!wire.windows(3).any(|w| w == b"one"), "plaintext on the wire");
-        assert_eq!(read(&s, wire).unwrap(), [b"one".as_slice(), &big].concat());
+        assert!(!wire.windows(marker.len()).any(|w| w == marker), "plaintext on the wire");
+        assert_eq!(read(&s, wire).unwrap(), [marker.as_slice(), &big].concat());
     }
 
     #[test]
