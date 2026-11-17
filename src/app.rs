@@ -465,8 +465,9 @@ pub(crate) async fn call(
     let body = req.body;
     let idle_for = limits.idle;
     let sender = rt.spawn(async move {
+        // no FIN after the body (its last frame ends it): dropping a stream that is still
+        // open resets it, and a reset is how the server learns the caller went away
         if send_body(&mut w, body, idle_for).await.is_ok() {
-            let _ = w.close().await;
             // keep the write half until the read side is done with the stream
             futures::future::pending::<()>().await;
         }

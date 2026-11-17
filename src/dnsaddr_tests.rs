@@ -25,7 +25,7 @@ fn start(cfg: NodeConfig) -> N {
 }
 
 /// Answers TXT queries from `txt` and A queries with 127.0.0.1; nothing else.
-fn dns_server(txt: HashMap<String, Vec<String>>) -> SocketAddr {
+pub(crate) fn dns_server(txt: HashMap<String, Vec<String>>) -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
     std::thread::spawn(move || {

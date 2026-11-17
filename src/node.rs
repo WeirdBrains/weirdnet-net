@@ -1540,11 +1540,14 @@ impl<Q: Message, R: Message> Loop<Q, R> {
 
     /// Close every connection and listener (relay circuits too).
     fn go_quiet(&mut self) {
-        for id in self.listeners.clone() {
-            self.swarm.remove_listener(id);
-        }
         // a node serving apps stays reachable through its relays
         let keep = self.keeps_relays();
+        let kept: HashSet<_> = if keep { self.relay_listeners.values().map(|(_, id, _)| *id).collect() } else { HashSet::new() };
+        for id in self.listeners.clone() {
+            if !kept.contains(&id) {
+                self.swarm.remove_listener(id);
+            }
+        }
         if !keep {
             for (_, (_, id, _)) in self.relay_listeners.clone() {
                 self.swarm.remove_listener(id);

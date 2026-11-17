@@ -21,6 +21,7 @@ pub mod sync;
 pub mod user;
 pub mod wss;
 
+pub use app::{AppError, AppHandler, AppRequest, AppResponse, Body as AppBody};
 pub use error::{NetError, Result};
 pub use events::{Event, Events, StatusWatch};
 pub use exchange::{Answer, DEFAULT_TTL_MS, Derived, Offer, Token, normalize_code};
@@ -42,6 +43,8 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+#[cfg(test)]
+mod app_tests;
 #[cfg(test)]
 mod content_tests;
 #[cfg(test)]
