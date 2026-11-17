@@ -33,6 +33,8 @@ libp2p = { version = "0.57", default-features = false, features = ["tokio", "tcp
 # every derivation, seal and open goes through the keys crate
 weirdnet-keys = { version = "0.1.0", default-features = false }
 chacha20poly1305 = "0.10"
+# app call heads (the same CBOR crate libp2p uses)
+cbor4ii = { version = "1.2", features = ["serde1", "use_std"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
