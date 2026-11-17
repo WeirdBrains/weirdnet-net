@@ -388,7 +388,8 @@ fn read_body<R: AsyncRead + Unpin + Send + 'static>(rt: &tokio::runtime::Handle,
         let mut total: u64 = 0;
         loop {
             let frame = idle(limits.idle, async {
-                let n = read_varint(&mut r).await.map_err(io_err)?.ok_or_else(|| AppError::Protocol("the body ended without its last frame".into()))?;
+                let n =
+                    read_varint(&mut r).await.map_err(io_err)?.ok_or_else(|| AppError::Protocol("the body ended without its last frame".into()))?;
                 if n == 0 {
                     return Ok(None);
                 }
@@ -423,6 +424,10 @@ fn read_body<R: AsyncRead + Unpin + Send + 'static>(rt: &tokio::runtime::Handle,
 
 // ---------- calling ----------
 
+async fn within<T>(deadline: tokio::time::Instant, f: impl Future<Output = Result<T, AppError>>) -> Result<T, AppError> {
+    tokio::time::timeout_at(deadline, f).await.map_err(|_| AppError::TimedOut)?
+}
+
 fn split(s: libp2p::Stream) -> (ReadHalf<libp2p::Stream>, WriteHalf<libp2p::Stream>) {
     s.split()
 }
@@ -437,12 +442,17 @@ pub(crate) async fn call(
     limits: AppLimits,
     deadline: tokio::time::Instant,
 ) -> Result<AppResponse, AppError> {
-    let head = cbor(&ReqHead { v: VERSION, app: req.app.clone(), method: req.method.clone(), path: req.path_with_query.clone(), headers: req.headers.clone() })?;
+    let head = cbor(&ReqHead {
+        v: VERSION,
+        app: req.app.clone(),
+        method: req.method.clone(),
+        path: req.path_with_query.clone(),
+        headers: req.headers.clone(),
+    })?;
     if head.len() > limits.header_max {
         return Err(AppError::TooLarge);
     }
-    let within = |f| async move { tokio::time::timeout_at(deadline, f).await.map_err(|_| AppError::TimedOut)? };
-    let (stream, _, _) = within(async {
+    let (stream, _, _) = within(deadline, async {
         control.open(peer, StreamProtocol::new(APP_PROTOCOL)).await.map_err(|e| match e {
             OpenError::Unsupported(_) => AppError::NoHandler,
             OpenError::Io(e) => AppError::Unreachable(e.to_string()),
@@ -450,7 +460,7 @@ pub(crate) async fn call(
     })
     .await?;
     let (mut r, mut w) = split(stream);
-    within(write_frame(&mut w, &head)).await?;
+    within(deadline, write_frame(&mut w, &head)).await?;
     // the request body goes out while the response comes in
     let body = req.body;
     let idle_for = limits.idle;
@@ -462,7 +472,7 @@ pub(crate) async fn call(
         }
     });
     let guard = AbortOnDrop(sender.abort_handle());
-    let bytes = within(read_head(&mut r, limits.header_max)).await?;
+    let bytes = within(deadline, read_head(&mut r, limits.header_max)).await?;
     let h: RespHead = uncbor(&bytes)?;
     if h.v != VERSION {
         return Err(AppError::Protocol(format!("version {}", h.v)));
@@ -491,16 +501,26 @@ impl Server {
     }
 
     pub(crate) fn check_app(app: &str) -> Result<(), AppError> {
-        let ok = (1..=64).contains(&app.len()) && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-');
+        let ok =
+            (1..=64).contains(&app.len()) && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !app.starts_with('-');
         if ok { Ok(()) } else { Err(AppError::Protocol(format!("bad app name {app:?} (a-z, 0-9 and -)"))) }
     }
 
-    pub(crate) fn serve(self: &Arc<Self>, rt: &tokio::runtime::Handle, control: &Control, app: &str, h: Arc<dyn AppHandler>, limits: AppLimits) -> Result<(), AppError> {
+    pub(crate) fn serve(
+        self: &Arc<Self>,
+        rt: &tokio::runtime::Handle,
+        control: &Control,
+        app: &str,
+        h: Arc<dyn AppHandler>,
+        limits: AppLimits,
+    ) -> Result<(), AppError> {
         Self::check_app(app)?;
         {
             let mut started = self.started.lock().unwrap();
             if !*started {
-                let mut inc = control.accept(StreamProtocol::new(APP_PROTOCOL), BACKLOG).ok_or_else(|| AppError::Protocol(format!("{APP_PROTOCOL} is accepted elsewhere")))?;
+                let mut inc = control
+                    .accept(StreamProtocol::new(APP_PROTOCOL), BACKLOG)
+                    .ok_or_else(|| AppError::Protocol(format!("{APP_PROTOCOL} is accepted elsewhere")))?;
                 let me = self.clone();
                 let rt2 = rt.clone();
                 rt.spawn(async move {
@@ -535,6 +555,10 @@ impl Server {
         had
     }
 
+    pub(crate) fn serves(&self, app: &str) -> bool {
+        self.handlers.read().unwrap().contains_key(app)
+    }
+
     pub(crate) fn apps(&self) -> Vec<String> {
         let mut v: Vec<String> = self.handlers.read().unwrap().keys().cloned().collect();
         v.sort();
@@ -551,7 +575,13 @@ impl Server {
         let Some(h) = self.handlers.read().unwrap().get(&head.app).cloned() else {
             return write_error(&mut w, &AppError::NoHandler).await;
         };
-        let req = AppRequest { app: head.app, method: head.method, path_with_query: head.path, headers: head.headers, body: read_body(&rt, r, limits, None) };
+        let req = AppRequest {
+            app: head.app,
+            method: head.method,
+            path_with_query: head.path,
+            headers: head.headers,
+            body: read_body(&rt, r, limits, None),
+        };
         match h.handle(peer, req).await {
             Err(e) => write_error(&mut w, &e).await,
             Ok(resp) => {
@@ -599,7 +629,9 @@ mod tests {
 
     #[test]
     fn heads_are_cbor_maps_with_the_spec_keys() {
-        let b = cbor(&ReqHead { v: 1, app: "morph".into(), method: "GET".into(), path: "/a?b=1".into(), headers: vec![("accept".into(), "*/*".into())] }).unwrap();
+        let b =
+            cbor(&ReqHead { v: 1, app: "morph".into(), method: "GET".into(), path: "/a?b=1".into(), headers: vec![("accept".into(), "*/*".into())] })
+                .unwrap();
         // a map of five entries whose first key is "v"
         assert_eq!(b[0], 0xa5);
         assert_eq!(&b[1..3], &[0x61, b'v']);

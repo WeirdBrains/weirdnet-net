@@ -8,6 +8,7 @@
 //! handle (the CLI and TUI are synchronous): requests wait for their answer. Requests
 //! that come in are answered by a [`Handler`] on Tokio's blocking pool.
 use crate::addr::{addr_peer, circuit_relay, reach_rank, routable, shareable};
+use crate::app::{AppError, AppHandler, AppRequest, AppResponse};
 use crate::error::{NetError, Result};
 use crate::events::{Event, Events, Hub, StatusWatch};
 use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
@@ -81,6 +82,12 @@ pub struct NodeConfig {
     /// DNS servers for `/dns` and `/dnsaddr` addresses (empty: the system's, or public
     /// resolvers where the system has none to read, as on Android).
     pub dns_servers: Vec<std::net::SocketAddr>,
+    /// App calls: the cap on a request or response head, in bytes (0: 16 KiB).
+    pub app_header_max: usize,
+    /// App calls: the cap on one body, in bytes (0: none, the default).
+    pub app_body_max: u64,
+    /// App calls: how long a call may go without a byte either way (zero: 60 seconds).
+    pub app_idle_timeout: Duration,
 }
 
 impl NodeConfig {
@@ -94,6 +101,14 @@ impl NodeConfig {
 
     fn req_timeout(&self) -> Duration {
         if self.request_timeout.is_zero() { REQUEST_TIMEOUT } else { self.request_timeout }
+    }
+
+    pub(crate) fn app_limits(&self) -> crate::app::AppLimits {
+        crate::app::AppLimits {
+            header_max: if self.app_header_max == 0 { crate::app::DEFAULT_HEADER_MAX } else { self.app_header_max },
+            body_max: self.app_body_max,
+            idle: if self.app_idle_timeout.is_zero() { crate::app::DEFAULT_IDLE_TIMEOUT } else { self.app_idle_timeout },
+        }
     }
 }
 
@@ -280,6 +295,7 @@ enum Cmd<Q, R> {
     GetEntries { user: String, reply: oneshot::Sender<Result<Vec<Entry>>> },
     FindPeer { peer: PeerId, reply: oneshot::Sender<Result<Vec<Multiaddr>>> },
     KnownAddrs { reply: oneshot::Sender<Result<Vec<(PeerId, Multiaddr)>>> },
+    PeerApps { peer: PeerId, reply: oneshot::Sender<Result<Option<Vec<String>>>> },
     Dial { addr: Multiaddr, reply: oneshot::Sender<Result<PeerId>> },
     Connect { peer: PeerId, addrs: Vec<Multiaddr>, reply: oneshot::Sender<Result<PeerId>> },
     DropPath { peer: PeerId, path: Path, reply: oneshot::Sender<Result<usize>> },
@@ -311,6 +327,11 @@ pub struct Node<Q: Message, R: Message> {
     hub: Hub,
     status_rx: tokio::sync::watch::Receiver<Status>,
     thread: Option<std::thread::JoinHandle<()>>,
+    apps: Arc<crate::app::Server>,
+    app_limits: crate::app::AppLimits,
+    /// Where peers found by [`Node::resolve_app`] are.
+    app_addrs: Mutex<HashMap<PeerId, Vec<Multiaddr>>>,
+    dns_servers: Vec<std::net::SocketAddr>,
 }
 
 fn net_err(e: impl std::fmt::Display) -> NetError {
@@ -432,6 +453,10 @@ impl<Q: Message, R: Message> Node<Q, R> {
         let st = status.clone();
         let names_list = cfg.names_servers.clone();
         let request_timeout = cfg.req_timeout();
+        let app_limits = cfg.app_limits();
+        let dns_servers = cfg.dns_servers.clone();
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving2 = serving.clone();
         let (streams_tx, streams_rx) = std::sync::mpsc::channel::<(tokio::runtime::Handle, Control)>();
         let hub = Hub::default();
         let (status_tx, status_rx) = tokio::sync::watch::channel(status.lock().map(|s| s.clone()).unwrap_or_default());
@@ -467,6 +492,7 @@ impl<Q: Message, R: Message> Node<Q, R> {
                     };
                     let mut l = Loop::new(profile, swarm, cfg, handler, st);
                     l.hub = hub2;
+                    l.serving = serving2;
                     l.status_tx = Some(status_tx);
                     l.run(rx, ready_tx).await;
                 });
@@ -476,7 +502,22 @@ impl<Q: Message, R: Message> Node<Q, R> {
         match ready_rx.recv_timeout(Duration::from_secs(20)) {
             Ok(Ok(())) => {
                 let streams = streams_rx.recv().map_err(|_| stopped())?;
-                Ok(Node { peer_id, profile, names_list, tx, status, request_timeout, streams, hub, status_rx, thread: Some(thread) })
+                Ok(Node {
+                    peer_id,
+                    profile,
+                    names_list,
+                    tx,
+                    status,
+                    request_timeout,
+                    streams,
+                    hub,
+                    status_rx,
+                    thread: Some(thread),
+                    apps: Arc::new(crate::app::Server::new(serving)),
+                    app_limits,
+                    app_addrs: Mutex::new(HashMap::new()),
+                    dns_servers,
+                })
             }
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -845,6 +886,163 @@ impl<Q: Message, R: Message> Node<Q, R> {
         .map_err(|_| stopped())?
     }
 
+    /// Serve app calls for `app` (`a-z`, `0-9`, `-`; up to 64 characters): calls to it go to
+    /// `handler`, and peers learn (through identify) that this node serves it. Serving
+    /// again replaces the handler. While a node serves any app it keeps its relay
+    /// reservations, even paused.
+    pub fn serve_app(&self, app: &str, handler: Arc<dyn AppHandler>) -> std::result::Result<(), AppError> {
+        let (rt, control) = &self.streams;
+        self.apps.serve(rt, control, app, handler, self.app_limits)
+    }
+
+    /// Stop serving `app`; returns whether it was served. Calls under way carry on.
+    pub fn stop_serving_app(&self, app: &str) -> bool {
+        self.apps.unserve(app)
+    }
+
+    /// The apps this node serves.
+    pub fn served_apps(&self) -> Vec<String> {
+        self.apps.apps()
+    }
+
+    /// The apps a connected peer announced (`None`: not connected, or not identified yet).
+    pub fn peer_apps(&self, peer: PeerId) -> Option<Vec<String>> {
+        self.call(|reply| Cmd::PeerApps { peer, reply }, Duration::from_secs(5)).ok().flatten()
+    }
+
+    /// The peers that serve `app` for `locator`: a peer id, a user id (32 hex digits) or a
+    /// name bound to a user by a `_weirdnet.<name>` TXT record. Users are found through the
+    /// names servers (relays this node holds a reservation on, and the configured ones) and
+    /// the DHT. Connects to each peer (directly first, then through the relay circuits in its
+    /// record) to learn what it serves; the addresses are kept for [`Node::app_call`].
+    pub fn resolve_app(&self, app: &str, locator: &str) -> std::result::Result<Vec<(PeerId, Vec<Multiaddr>)>, AppError> {
+        crate::app::Server::check_app(app)?;
+        let locator = locator.trim();
+        let mut found: Vec<(PeerId, Vec<Multiaddr>)> = vec![];
+        if let Ok(peer) = locator.parse::<PeerId>() {
+            let mut addrs = self.find_peer(peer).unwrap_or_default();
+            for (_, a) in self.names_servers() {
+                for base in a {
+                    let base: Multiaddr = base.iter().take_while(|p| *p != Protocol::P2pCircuit).collect();
+                    addrs.push(base.with(Protocol::P2pCircuit).with(Protocol::P2p(peer)));
+                }
+            }
+            found.push((peer, addrs));
+        } else {
+            let user = if is_user_id(locator) { locator.to_string() } else { self.resolve_name(locator)? };
+            match self.lookup(&user) {
+                Lookup::Found(rec) => {
+                    let peer: PeerId = rec.cert.peer_id.parse().map_err(|_| AppError::Protocol("a record with a bad peer id".into()))?;
+                    let mut addrs: Vec<Multiaddr> = rec.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+                    if let Some(home) = rec.home_relay.as_deref().and_then(|a| a.parse::<Multiaddr>().ok()) {
+                        let c = home.with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
+                        if !addrs.contains(&c) {
+                            addrs.push(c);
+                        }
+                    }
+                    found.push((peer, addrs));
+                }
+                Lookup::Withdrawn(_) | Lookup::NotFound => return Err(AppError::NotFound),
+            }
+        }
+        let mut out = vec![];
+        let mut reached = false;
+        let mut last = AppError::NotFound;
+        for (peer, addrs) in found {
+            if peer == self.peer_id {
+                if self.apps.serves(app) {
+                    out.push((peer, vec![]));
+                } else {
+                    last = AppError::NoHandler;
+                }
+                continue;
+            }
+            let wait = self.request_timeout;
+            let rt = self.streams.0.clone();
+            let tx = self.tx.clone();
+            let a2 = addrs.clone();
+            let r = futures::executor::block_on(rt.spawn(async move { connect_phased(tx, peer, a2, tokio::time::Instant::now() + wait).await }));
+            match r.unwrap_or_else(|_| Err(AppError::Unreachable("the node stopped".into()))) {
+                Ok(()) => reached = true,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            }
+            // identify comes right after connecting
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            let apps = loop {
+                if let Some(a) = self.peer_apps(peer) {
+                    break a;
+                }
+                if std::time::Instant::now() > until {
+                    break vec![];
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            self.app_addrs.lock().unwrap().insert(peer, addrs.clone());
+            if apps.iter().any(|a| a == app) {
+                out.push((peer, addrs));
+            } else {
+                last = AppError::NoHandler;
+            }
+        }
+        if out.is_empty() {
+            return Err(if reached { AppError::NoHandler } else { last });
+        }
+        Ok(out)
+    }
+
+    /// The user a name is bound to (`_weirdnet.<name>` TXT, through the node's DNS servers).
+    fn resolve_name(&self, name: &str) -> std::result::Result<String, AppError> {
+        let servers = self.dns_servers.clone();
+        let q = crate::names::binding_name(name);
+        let rt = self.streams.0.clone();
+        futures::executor::block_on(rt.spawn(async move { txt_records(&servers, &q).await }))
+            .map_err(|_| AppError::Unreachable("the node stopped".into()))??
+            .iter()
+            .find_map(|t| crate::names::parse_binding(t).ok())
+            .ok_or(AppError::NotFound)
+    }
+
+    /// Call `app` on `peer`: connect if needed (directly first, then through the relay
+    /// circuits [`Node::resolve_app`] found), open a stream and send `req`. `timeout` covers
+    /// getting the response head; the bodies then may go on as long as bytes keep flowing
+    /// (see [`NodeConfig::app_idle_timeout`]). Dropping the future or the response body
+    /// cancels the call. Works on any executor.
+    pub async fn app_call(&self, peer: PeerId, req: AppRequest, timeout: Duration) -> std::result::Result<AppResponse, AppError> {
+        let addrs = self.app_addrs.lock().unwrap().get(&peer).cloned().unwrap_or_default();
+        self.app_call_via(peer, &addrs, req, timeout).await
+    }
+
+    /// [`Node::app_call`] trying `addrs` (direct addresses and circuits) to reach the peer.
+    pub async fn app_call_via(
+        &self,
+        peer: PeerId,
+        addrs: &[Multiaddr],
+        req: AppRequest,
+        timeout: Duration,
+    ) -> std::result::Result<AppResponse, AppError> {
+        if peer == self.peer_id {
+            return Err(AppError::Unreachable("this node".into()));
+        }
+        let (rt, control) = &self.streams;
+        let (rt, control, tx, limits, addrs) = (rt.clone(), control.clone(), self.tx.clone(), self.app_limits, addrs.to_vec());
+        let rt2 = rt.clone();
+        let task = rt.spawn(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            connect_phased(tx, peer, addrs, deadline).await?;
+            crate::app::call(rt2, control, peer, req, limits, deadline).await
+        });
+        let _guard = crate::app::AbortOnDrop(task.abort_handle());
+        task.await.map_err(|_| AppError::Unreachable("the node stopped".into()))?
+    }
+
+    /// [`Node::app_call`] for blocking callers.
+    pub fn app_call_blocking(&self, peer: PeerId, req: AppRequest, timeout: Duration) -> std::result::Result<AppResponse, AppError> {
+        futures::executor::block_on(self.app_call(peer, req, timeout))
+    }
+
     /// Listen on one more address; returns the address it got.
     pub fn listen(&self, addr: Multiaddr) -> Result<Multiaddr> {
         self.call(|reply| Cmd::Listen { addr, reply }, Duration::from_secs(20))
@@ -884,6 +1082,72 @@ impl<Q: Message, R: Message> Drop for Node<Q, R> {
 }
 
 /// The resolver: the given servers, else the system's, else Cloudflare's and Google's.
+/// A user id: 32 lowercase hex digits.
+fn is_user_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The TXT records of `name` (none if it has none).
+async fn txt_records(servers: &[std::net::SocketAddr], name: &str) -> std::result::Result<Vec<String>, AppError> {
+    use hickory_resolver::proto::rr::{RData, RecordType};
+    let (config, opts) = dns_config(servers);
+    let r = hickory_resolver::Resolver::builder_with_config(config, hickory_resolver::net::runtime::TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .map_err(|e| AppError::Unreachable(format!("dns: {e}")))?;
+    let l = match r.lookup(name, RecordType::TXT).await {
+        Ok(l) => l,
+        Err(e) if e.is_no_records_found() || e.is_nx_domain() => return Ok(vec![]),
+        Err(e) => return Err(AppError::Unreachable(format!("dns: {e}"))),
+    };
+    Ok(l.answers()
+        .iter()
+        .filter_map(|rec| match &rec.data {
+            RData::TXT(t) => Some(t.txt_data.iter().map(|b| String::from_utf8_lossy(b)).collect::<String>()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Connect to `peer` by `addrs`: the direct ones first (a few seconds when circuits are
+/// left), then the relay circuits (the relay is dialed on all its addresses).
+async fn connect_phased<Q: Message, R: Message>(
+    tx: mpsc::UnboundedSender<Cmd<Q, R>>,
+    peer: PeerId,
+    addrs: Vec<Multiaddr>,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<(), AppError> {
+    let (circuits, direct): (Vec<Multiaddr>, Vec<Multiaddr>) = addrs.into_iter().partition(|a| a.iter().any(|p| p == Protocol::P2pCircuit));
+    let connect = |addrs: Vec<Multiaddr>, until: tokio::time::Instant| {
+        let tx = tx.clone();
+        async move {
+            let (rtx, rrx) = oneshot::channel();
+            tx.send(Cmd::Connect { peer, addrs, reply: rtx }).map_err(|_| AppError::Unreachable("the node stopped".into()))?;
+            match tokio::time::timeout_at(until, rrx).await {
+                Err(_) => Err(AppError::TimedOut),
+                Ok(Err(_)) => Err(AppError::Unreachable("the node stopped".into())),
+                Ok(Ok(Err(e))) => Err(AppError::Unreachable(e.to_string())),
+                Ok(Ok(Ok(_))) => Ok(()),
+            }
+        }
+    };
+    if circuits.is_empty() {
+        return connect(direct, deadline).await;
+    }
+    let first = (tokio::time::Instant::now() + DIRECT_FIRST).min(deadline);
+    let direct_err = match connect(direct, first).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(direct_err);
+    }
+    connect(circuits, deadline).await
+}
+
+/// How long app calls try a peer's direct addresses before its relay circuits.
+const DIRECT_FIRST: Duration = Duration::from_secs(4);
+
 fn dns_config(servers: &[std::net::SocketAddr]) -> (libp2p::dns::ResolverConfig, libp2p::dns::ResolverOpts) {
     use hickory_resolver::config::{CLOUDFLARE, GOOGLE, NameServerConfig, ResolverConfig};
     if !servers.is_empty() {
@@ -957,6 +1221,14 @@ struct Loop<Q: Message, R: Message> {
     relay_retry: Vec<(Multiaddr, std::time::Instant, Duration)>,
     /// How long to wait before asking a relay again; reset when it accepts.
     relay_backoff: HashMap<PeerId, Duration>,
+    /// Every address of each relay (all dialed at once).
+    relay_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Relays being dialed; reserve once connected.
+    relay_pending: HashSet<PeerId>,
+    /// The node serves apps: keep relay reservations, even paused.
+    serving: Arc<std::sync::atomic::AtomicBool>,
+    /// The apps each connected peer announces (identify).
+    peer_apps: HashMap<PeerId, Vec<String>>,
 }
 
 fn path_of(relayed: bool) -> Path {
@@ -1016,6 +1288,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             paused: false,
             relay_retry: vec![],
             relay_backoff: HashMap::new(),
+            relay_addrs: HashMap::new(),
+            relay_pending: HashSet::new(),
+            serving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peer_apps: HashMap::new(),
         }
     }
 
@@ -1068,6 +1344,14 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         }
         // relays first: a reservation dials its relay, and a second dial to the same peer
         // already under way would make the relay client skip its own
+        for r in &self.cfg.relays {
+            if let Some(p) = addr_peer(r) {
+                let v = self.relay_addrs.entry(p).or_default();
+                if !v.contains(r) {
+                    v.push(r.clone());
+                }
+            }
+        }
         for r in self.cfg.relays.clone() {
             self.add_relay(r);
         }
@@ -1160,11 +1444,40 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             tracing::warn!("network: relay address {addr} has no /p2p/ peer id");
             return;
         };
-        if peer == *self.swarm.local_peer_id() || !self.relay_listening.insert(peer) {
+        if peer == *self.swarm.local_peer_id() {
+            return;
+        }
+        let known = self.relay_addrs.entry(peer).or_default();
+        if !known.contains(&addr) {
+            known.push(addr.clone());
+        }
+        self.swarm.add_peer_address(peer, addr.clone());
+        if !self.relay_listening.insert(peer) {
             return;
         }
         self.relays.insert(peer);
-        self.swarm.add_peer_address(peer, addr.clone());
+        if self.swarm.is_connected(&peer) {
+            return self.reserve_on(peer);
+        }
+        // dial every address of the relay at once (TCP, QUIC, WSS…) and reserve once one
+        // connects: the relay client would dial only the one address it was given
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        let addrs = self.relay_addrs.get(&peer).cloned().unwrap_or_default();
+        match self.swarm.dial(DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build()) {
+            Ok(()) | Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => {
+                self.relay_pending.insert(peer);
+            }
+            Err(e) => {
+                tracing::warn!("network: cannot dial relay {peer}: {e}");
+                self.relay_listening.remove(&peer);
+                self.retry_relay_later(peer, addr);
+            }
+        }
+    }
+
+    /// Ask a connected relay for a reservation (listen through it).
+    fn reserve_on(&mut self, peer: PeerId) {
+        let Some(addr) = self.relay_addrs.get(&peer).and_then(|v| v.first().cloned()) else { return };
         let circuit = addr.with(Protocol::P2pCircuit);
         match self.swarm.listen_on(circuit.clone()) {
             Ok(id) => {
@@ -1177,6 +1490,18 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         }
     }
 
+    /// Dial a relay again later, backing off to a minute.
+    fn retry_relay_later(&mut self, relay: PeerId, addr: Multiaddr) {
+        let wait = self.relay_backoff.get(&relay).copied().unwrap_or(Duration::from_secs(1));
+        self.relay_backoff.insert(relay, (wait * 2).min(Duration::from_secs(60)));
+        self.relay_retry.retain(|(a, _, _)| addr_peer(a) != Some(relay));
+        self.relay_retry.push((addr, std::time::Instant::now() + wait, wait));
+    }
+
+    fn keeps_relays(&self) -> bool {
+        self.serving.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// A relay's circuit listener closed (its connection went away, or we paused): the
     /// reservation is gone; ask again later unless paused.
     fn relay_listener_closed(&mut self, id: libp2p::core::transport::ListenerId) {
@@ -1187,7 +1512,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         self.update(|s| s.reservations.retain(|x| *x != r));
         self.hub.send(Event::ReservationLost { relay });
         circuit.pop();
-        if !self.paused {
+        if !self.paused || self.keeps_relays() {
             let wait = self.relay_backoff.get(&relay).copied().unwrap_or(Duration::from_secs(1));
             self.relay_backoff.insert(relay, (wait * 2).min(Duration::from_secs(60)));
             self.relay_retry.retain(|(a, _, _)| *a != circuit);
@@ -1196,7 +1521,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
     }
 
     fn retry_lost_reservations(&mut self) {
-        if self.paused {
+        if self.paused && !self.keeps_relays() {
             return;
         }
         let now = std::time::Instant::now();
@@ -1218,10 +1543,14 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         for id in self.listeners.clone() {
             self.swarm.remove_listener(id);
         }
-        for (_, (_, id, _)) in self.relay_listeners.clone() {
-            self.swarm.remove_listener(id);
+        // a node serving apps stays reachable through its relays
+        let keep = self.keeps_relays();
+        if !keep {
+            for (_, (_, id, _)) in self.relay_listeners.clone() {
+                self.swarm.remove_listener(id);
+            }
         }
-        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|p| !(keep && self.relays.contains(p))).collect();
         for p in peers {
             let _ = self.swarm.disconnect_peer_id(p);
         }
@@ -1289,7 +1618,13 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         let waiting = addrs.iter().filter_map(circuit_relay).find(|(r, _)| *r != *self.swarm.local_peer_id() && !self.swarm.is_connected(r));
         if let Some((relay, raddr)) = waiting {
             use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
-            let _ = self.swarm.dial(DialOpts::peer_id(relay).addresses(vec![raddr]).condition(PeerCondition::DisconnectedAndNotDialing).build());
+            let mut all = vec![raddr];
+            for a in self.relay_addrs.get(&relay).into_iter().flatten() {
+                if !all.contains(a) {
+                    all.push(a.clone());
+                }
+            }
+            let _ = self.swarm.dial(DialOpts::peer_id(relay).addresses(all).condition(PeerCondition::DisconnectedAndNotDialing).build());
             self.deferred.push((relay, std::time::Instant::now(), c));
             return;
         }
@@ -1377,6 +1712,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 let q = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
                 self.finds.insert(q, (peer, reply));
             }
+            Cmd::PeerApps { peer, reply } => {
+                let _ = reply.send(Ok(self.peer_apps.get(&peer).cloned()));
+            }
             Cmd::KnownAddrs { reply } => {
                 let v = self.addr_book.iter().flat_map(|(p, a)| a.iter().map(|a| (*p, a.clone()))).collect();
                 let _ = reply.send(Ok(v));
@@ -1417,9 +1755,11 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 if !self.paused {
                     self.paused = true;
                     // relays to come back to
+                    let keep = self.keeps_relays();
                     let mut back: Vec<Multiaddr> = self
                         .relay_listeners
                         .values()
+                        .filter(|_| !keep)
                         .map(|(c, _, _)| {
                             let mut c = c.clone();
                             c.pop();
@@ -1526,6 +1866,15 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                 self.release_deferred(Some(peer_id));
+                if self.relay_pending.remove(&peer_id) {
+                    if !self.paused || self.keeps_relays() {
+                        self.reserve_on(peer_id);
+                    } else if let Some(a) = self.relay_addrs.get(&peer_id).and_then(|v| v.first().cloned()) {
+                        // paused meanwhile: reserve when the app comes back
+                        self.relay_listening.remove(&peer_id);
+                        self.relay_retry.push((a, std::time::Instant::now(), Duration::from_secs(1)));
+                    }
+                }
                 let relayed = endpoint_relayed(&endpoint);
                 self.conns.insert(connection_id, (peer_id, relayed));
                 self.hub.send(Event::Connected { peer: peer_id, path: path_of(relayed) });
@@ -1555,6 +1904,7 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 if num_established == 0 {
                     self.heard.remove(&peer_id);
+                    self.peer_apps.remove(&peer_id);
                 }
                 self.refresh()
             }
@@ -1563,6 +1913,12 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                     && !self.swarm.is_connected(&p)
                 {
                     self.release_deferred(Some(p));
+                    if self.relay_pending.remove(&p) {
+                        self.relay_listening.remove(&p);
+                        if let Some(a) = self.relay_addrs.get(&p).and_then(|v| v.first().cloned()) {
+                            self.retry_relay_later(p, a);
+                        }
+                    }
                 }
                 let msg = error.to_string();
                 let mut i = 0;
@@ -1729,6 +2085,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, a.clone());
                     }
                 }
+                let apps: Vec<String> = protos.iter().filter_map(|p| crate::app::announced(p)).map(str::to_string).collect();
+                caps.extend(apps.iter().map(|a| format!("app:{a}")));
+                self.peer_apps.insert(peer_id, apps);
                 let is_relay = caps.iter().any(|c| c == "relay");
                 let addrs: Vec<String> = info.listen_addrs.iter().filter(|a| shareable(a)).map(|a| a.to_string()).collect();
                 self.heard.insert(peer_id, info.listen_addrs.iter().filter(|a| shareable(a)).take(8).cloned().collect());
