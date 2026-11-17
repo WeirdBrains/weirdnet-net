@@ -6,6 +6,21 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `DiscoveryMode` on `NodeConfig` (`Enabled` by default). `Disabled` turns off mDNS and
+  Kademlia (bootstrap, advertising, and learning peers from identify). Configured relays,
+  listen, request-response, app calls, content streams and manual peers still work. DHT
+  APIs (`provide`, `find_peer`, `put_entry`, locators, and the rest) return
+  "peer discovery is disabled".
+- Manual peers: `PeerHint`, `NodeConfig::peers`, `Node::add_peer` / `remove_peer` /
+  `peers`, and `encode_peers` / `decode_peers` for the application to persist. Address
+  hints are not trust; `NodeCert` and the application's roster authorize a peer.
+
+### Changed
+
+- `Status` reports whether discovery is on (`discovery: bool`).
+
 ## [0.5.0] - 2026-11-17
 
 ### Added

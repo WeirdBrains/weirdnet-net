@@ -12,6 +12,7 @@ use crate::app::{AppError, AppHandler, AppRequest, AppResponse};
 use crate::error::{NetError, Result};
 use crate::events::{Event, Events, Hub, StatusWatch};
 use crate::names::{Entry, Lookup, Names, NamesRequest, NamesResponse};
+use crate::peers::{DiscoveryMode, PeerHint};
 use crate::profile::Profile;
 use crate::stream::transport::Control;
 use crate::stream::{Incoming, Limits, Path, Stream};
@@ -44,8 +45,16 @@ pub const RESPONSE_MAX: u64 = 256 * 1024 * 1024;
 pub struct NodeConfig {
     /// Addresses to listen on (none: only dial out).
     pub listen: Vec<Multiaddr>,
-    /// Find and announce peers on the local network.
+    /// Find and announce peers on the local network (only when [`NodeConfig::discovery`] is
+    /// enabled, and never on the in-memory transport).
     pub mdns: bool,
+    /// Peer discovery (mDNS when [`NodeConfig::mdns`] is set, and Kademlia). Enabled by
+    /// default. Disabled: no LAN announcements or DHT; configured relays, [`NodeConfig::peers`]
+    /// and explicit dials (including serving apps and content) still work.
+    pub discovery: DiscoveryMode,
+    /// Peers to dial without discovering them (addresses plus a peer id). Adding a peer
+    /// does not grant trust; certificates do. The application persists this list.
+    pub peers: Vec<PeerHint>,
     /// Relay traffic for other nodes (and say so).
     pub relay_server: bool,
     /// Kademlia bootstrap nodes (`/ip4/…/tcp/…/p2p/…`).
@@ -259,6 +268,9 @@ pub struct Status {
     pub reservations: Vec<String>,
     pub relay_server: bool,
     pub mdns: bool,
+    /// Whether peer discovery (mDNS, Kademlia) is on.
+    #[serde(default)]
+    pub discovery: bool,
     pub started_at: i64,
     /// Paused by the app ([`Node::pause`]).
     #[serde(default)]
@@ -305,6 +317,9 @@ enum Cmd<Q, R> {
     NetworkChanged { reply: oneshot::Sender<Result<()>> },
     Listen { addr: Multiaddr, reply: oneshot::Sender<Result<Multiaddr>> },
     AddRelay { addr: Multiaddr },
+    AddPeer { hint: PeerHint, reply: oneshot::Sender<Result<()>> },
+    RemovePeer { peer: PeerId, reply: oneshot::Sender<Result<()>> },
+    ListPeers { reply: oneshot::Sender<Result<Vec<PeerHint>>> },
     Provide { key: Vec<u8>, reply: oneshot::Sender<Result<()>> },
     PutLocator { rec: crate::locator::LocatorRecord, reply: oneshot::Sender<Result<()>> },
     GetLocators { key: Vec<u8>, reply: oneshot::Sender<Result<Vec<crate::locator::LocatorRecord>>> },
@@ -371,7 +386,11 @@ fn behaviour<Q: Message, R: Message>(
         request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
     );
     let kad = kad::Behaviour::with_config(peer, MemoryStore::new(peer), kcfg);
-    let mdns = if cfg.mdns && !cfg.memory { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer).map_err(net_err)?) } else { None };
+    let mdns = if cfg.discovery.is_enabled() && cfg.mdns && !cfg.memory {
+        Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer).map_err(net_err)?)
+    } else {
+        None
+    };
     let relay_server = cfg.relay_server.then(|| relay::Behaviour::new(peer, cfg.relay_limits.config()));
     let autonat = autonat::Behaviour::new(peer, autonat::Config { only_global_ips: !cfg.memory, ..Default::default() });
     Ok(Behaviour {
@@ -444,7 +463,8 @@ impl<Q: Message, R: Message> Node<Q, R> {
             peer_id: peer_id.to_string(),
             nat: "unknown".into(),
             relay_server: cfg.relay_server,
-            mdns: cfg.mdns && !cfg.memory,
+            mdns: cfg.discovery.is_enabled() && cfg.mdns && !cfg.memory,
+            discovery: cfg.discovery.is_enabled(),
             started_at: crate::now_ms(),
             ..Default::default()
         }));
@@ -741,6 +761,21 @@ impl<Q: Message, R: Message> Node<Q, R> {
     pub fn connect(&self, peer: PeerId, addrs: &[Multiaddr]) -> Result<()> {
         let addrs = addrs.to_vec();
         self.call(|reply| Cmd::Connect { peer, addrs, reply }, Duration::from_secs(30)).map(|_| ())
+    }
+
+    /// Remember `hint` and dial it. This does not certify the peer.
+    pub fn add_peer(&self, hint: PeerHint) -> Result<()> {
+        self.call(|reply| Cmd::AddPeer { hint, reply }, Duration::from_secs(30))
+    }
+
+    /// Forget a manual peer (open connections stay until dropped).
+    pub fn remove_peer(&self, peer: PeerId) -> Result<()> {
+        self.call(|reply| Cmd::RemovePeer { peer, reply }, Duration::from_secs(5))
+    }
+
+    /// The manual peer list (from config and [`Node::add_peer`]).
+    pub fn peers(&self) -> Result<Vec<PeerHint>> {
+        self.call(|reply| Cmd::ListPeers { reply }, Duration::from_secs(5))
     }
 
     /// Close this node's direct or relayed connections to `peer`; returns how many. Streams on
@@ -1355,15 +1390,20 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         for r in self.cfg.relays.clone() {
             self.add_relay(r);
         }
-        for b in self.cfg.bootstrap.clone() {
-            if let Some(p) = addr_peer(&b) {
-                self.swarm.behaviour_mut().kad.add_address(&p, b.clone());
-                if !self.relay_listening.contains(&p) {
-                    let _ = self.swarm.dial(b);
+        if self.cfg.discovery.is_enabled() {
+            for b in self.cfg.bootstrap.clone() {
+                if let Some(p) = addr_peer(&b) {
+                    self.swarm.behaviour_mut().kad.add_address(&p, b.clone());
+                    if !self.relay_listening.contains(&p) {
+                        let _ = self.swarm.dial(b);
+                    }
                 }
             }
         }
-        if self.cfg.relay_server {
+        for hint in self.cfg.peers.clone() {
+            self.dial_hint(&hint);
+        }
+        if self.cfg.relay_server && self.cfg.discovery.is_enabled() {
             self.swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
         }
         if waiting == 0
@@ -1423,6 +1463,9 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             n.0.prune(crate::now_ms());
         }
         if self.paused {
+            return;
+        }
+        if !self.cfg.discovery.is_enabled() {
             return;
         }
         let k = &mut self.swarm.behaviour_mut().kad;
@@ -1572,16 +1615,21 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         for r in relays {
             self.add_relay(r);
         }
-        for b in self.cfg.bootstrap.clone() {
-            if let Some(p) = addr_peer(&b)
-                && !self.relay_listening.contains(&p)
-            {
-                let _ = self.swarm.dial(b);
+        if self.cfg.discovery.is_enabled() {
+            for b in self.cfg.bootstrap.clone() {
+                if let Some(p) = addr_peer(&b)
+                    && !self.relay_listening.contains(&p)
+                {
+                    let _ = self.swarm.dial(b);
+                }
+            }
+            let k = &mut self.swarm.behaviour_mut().kad;
+            if !routing_empty(k) {
+                let _ = k.bootstrap();
             }
         }
-        let k = &mut self.swarm.behaviour_mut().kad;
-        if !routing_empty(k) {
-            let _ = k.bootstrap();
+        for hint in self.cfg.peers.clone() {
+            self.dial_hint(&hint);
         }
     }
 
@@ -1645,6 +1693,53 @@ impl<Q: Message, R: Message> Loop<Q, R> {
         }
     }
 
+    fn require_discovery(&self) -> Result<()> {
+        if self.cfg.discovery.is_enabled() { Ok(()) } else { Err(NetError::Network("peer discovery is disabled".into())) }
+    }
+
+    /// Remember addresses and dial; does not reserve a relay or grant trust.
+    fn dial_hint(&mut self, hint: &PeerHint) {
+        let Ok(peer) = hint.peer_id() else {
+            tracing::warn!("network: invalid manual peer id {}", hint.peer_id);
+            return;
+        };
+        if peer == *self.swarm.local_peer_id() {
+            return;
+        }
+        let Ok(addrs) = hint.multiaddrs() else {
+            tracing::warn!("network: invalid manual peer addresses for {peer}");
+            return;
+        };
+        for a in &addrs {
+            self.swarm.add_peer_address(peer, a.clone());
+            if self.cfg.discovery.is_enabled() {
+                self.swarm.behaviour_mut().kad.add_address(&peer, a.clone());
+            }
+        }
+        if self.paused || self.swarm.is_connected(&peer) {
+            return;
+        }
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        let _ = self.swarm.dial(DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build());
+    }
+
+    fn remember_peer(&mut self, hint: PeerHint) -> Result<()> {
+        hint.multiaddrs()?;
+        if let Some(existing) = self.cfg.peers.iter_mut().find(|p| p.peer_id == hint.peer_id) {
+            for a in &hint.addrs {
+                if !existing.addrs.contains(a) {
+                    existing.addrs.push(a.clone());
+                }
+            }
+            let merged = existing.clone();
+            self.dial_hint(&merged);
+        } else {
+            self.dial_hint(&hint);
+            self.cfg.peers.push(hint);
+        }
+        Ok(())
+    }
+
     fn execute(&mut self, c: Cmd<Q, R>) {
         match c {
             Cmd::Request { peer, addrs, wire, reply } => {
@@ -1662,6 +1757,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 self.names_pending.insert(id, reply);
             }
             Cmd::PutEntry { entry, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let key = kad::RecordKey::new(&self.profile.record_key(entry.user_id()));
                 let existing = self.swarm.behaviour_mut().kad.store_mut().get(&key).and_then(|r| Entry::decode(&r.value).ok());
                 if let Err(e) = self.profile.accept(existing.as_ref(), &entry, crate::now_ms()) {
@@ -1679,6 +1778,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             }
             Cmd::PutLocator { rec, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let now = crate::now_ms();
                 let key = match rec.key() {
                     Ok(k) => k,
@@ -1704,14 +1807,26 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             }
             Cmd::GetLocators { key, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let q = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&key));
                 self.lgets.insert(q, (vec![], reply));
             }
             Cmd::GetEntries { user, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let q = self.swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&self.profile.record_key(&user)));
                 self.gets.insert(q, (vec![], reply));
             }
             Cmd::FindPeer { peer, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let q = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
                 self.finds.insert(q, (peer, reply));
             }
@@ -1811,12 +1926,35 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
             },
             Cmd::AddRelay { addr } => self.add_relay(addr),
+            Cmd::AddPeer { hint, reply } => {
+                let _ = reply.send(self.remember_peer(hint));
+            }
+            Cmd::RemovePeer { peer, reply } => {
+                let id = peer.to_string();
+                self.cfg.peers.retain(|p| p.peer_id != id);
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::ListPeers { reply } => {
+                let _ = reply.send(Ok(self.cfg.peers.clone()));
+            }
             Cmd::Provide { key, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let r = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&key)).map(|_| ()).map_err(net_err);
                 let _ = reply.send(r);
             }
-            Cmd::StopProviding { key } => self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(&key)),
+            Cmd::StopProviding { key } => {
+                if self.cfg.discovery.is_enabled() {
+                    self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(&key));
+                }
+            }
             Cmd::Providers { key, reply } => {
+                if let Err(e) = self.require_discovery() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
                 let q = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&key));
                 self.provs.insert(q, (vec![], reply));
             }
@@ -2065,9 +2203,11 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 for (p, addrs) in by_peer {
                     for a in &addrs {
                         self.swarm.add_peer_address(p, a.clone());
-                        self.swarm.behaviour_mut().kad.add_address(&p, a.clone());
+                        if self.cfg.discovery.is_enabled() {
+                            self.swarm.behaviour_mut().kad.add_address(&p, a.clone());
+                        }
                     }
-                    if !self.paused && !self.swarm.is_connected(&p) {
+                    if self.cfg.discovery.is_enabled() && !self.paused && !self.swarm.is_connected(&p) {
                         let _ = self.swarm.dial(p);
                     }
                     self.seen(Sighting { peer: p, addrs: addrs.iter().map(|a| a.to_string()).collect(), caps: None, agent: None, source: "mdns" });
@@ -2084,8 +2224,10 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 }
                 if protos.iter().any(|p| p == self.profile.kad) {
                     caps.push("kad".to_string());
-                    for a in &info.listen_addrs {
-                        self.swarm.behaviour_mut().kad.add_address(&peer_id, a.clone());
+                    if self.cfg.discovery.is_enabled() {
+                        for a in &info.listen_addrs {
+                            self.swarm.behaviour_mut().kad.add_address(&peer_id, a.clone());
+                        }
                     }
                 }
                 let apps: Vec<String> = protos.iter().filter_map(|p| crate::app::announced(p)).map(str::to_string).collect();
@@ -2097,7 +2239,8 @@ impl<Q: Message, R: Message> Loop<Q, R> {
                 self.seen(Sighting { peer: peer_id, addrs, caps: Some(caps), agent: Some(info.agent_version), source: "identify" });
                 // behind NAT: use relays we meet
                 let private = self.status.lock().map(|s| s.nat == "private").unwrap_or(false);
-                if is_relay
+                if self.cfg.discovery.is_enabled()
+                    && is_relay
                     && private
                     && !self.paused
                     && self.relay_listening.is_empty()

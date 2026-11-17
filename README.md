@@ -17,6 +17,12 @@ response types, its own storage and its own policy; the crate brings the wire.
   the user's record up and dials it.
   Request and response caps and the request timeout are `NodeConfig` settings
   (`request_max`, `response_max`, `request_timeout`; 8 MiB, 256 MiB and 60 s by default).
+  `NodeConfig::discovery` (`DiscoveryMode`, enabled by default) turns peer finding on or
+  off: disabled, the node does not run mDNS or Kademlia, but still listens, uses configured
+  relays, dials [`PeerHint`]s (`NodeConfig::peers`, `Node::add_peer`) and serves apps and
+  content to peers it is connected to. A hint is an address book entry, not trust; the
+  application's roster and `NodeCert` decide that. The application persists the list
+  (`encode_peers` / `decode_peers`).
 - `stream`: byte streams with no size cap. An application accepts its own protocol ids
   (`Node::accept_streams("/myapp/sync/1", Limits)`) and opens them
   (`Node::open_stream(peer, addrs, protocol, Limits)`); one node carries any number of

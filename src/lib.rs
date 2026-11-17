@@ -13,6 +13,7 @@ pub mod locator;
 pub mod member;
 pub mod names;
 pub mod node;
+pub mod peers;
 pub mod profile;
 pub mod sealed;
 pub mod shard;
@@ -28,6 +29,7 @@ pub use exchange::{Answer, DEFAULT_TTL_MS, Derived, Offer, Token, normalize_code
 pub use libp2p::identity::{Keypair, PublicKey};
 pub use libp2p::{Multiaddr, PeerId};
 pub use node::{Handler, Message, Node, NodeConfig, RelayLimits, Sighting, Status};
+pub use peers::{DiscoveryMode, PeerHint, decode_peers, encode_peers};
 pub use profile::{Profile, WEIRDNET};
 pub use stream::{Incoming, Limits, Path, Stream};
 pub use weirdnet_keys::{Key32, Sealed};
@@ -47,6 +49,8 @@ pub fn now_ms() -> i64 {
 mod app_tests;
 #[cfg(test)]
 mod content_tests;
+#[cfg(test)]
+mod discovery_tests;
 #[cfg(test)]
 mod dnsaddr_tests;
 #[cfg(test)]
