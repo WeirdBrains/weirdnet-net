@@ -144,21 +144,35 @@ stays on the relay, QUIC to the relay, mDNS on a LAN, and AutoNAT verdicts, each
 content fetch. Run it with `sudo harness/netns.sh target/debug/examples/netns_node`.
 
 Every identifier on the wire or under a signature comes from a `Profile`. `WEIRDNET` is the
-default (`/weirdnet/net/1`, `wnet-x1-offer:`, `weirdnet://join/`, port 4747 and so on). An
-application with nodes already in the field passes its own profile with the values those
-nodes use, so nothing changes for them.
+default (`/weirdnet/net/1`, `wnet-x1-offer:`, port 4747 and so on). An application with nodes
+already in the field passes its own profile with the values those nodes use, so nothing
+changes for them.
+
+Invitation and answer links go on the app's own scheme, `weirdnet-<app>://` (for example
+`weirdnet-morph://join/`): set `join_link`, `answer_link` and `link_mark` in the app's
+profile, as below. The bare `weirdnet://` scheme is reserved for internal Weirdnet messages;
+it is not registered with the OS and nothing routes through it.
 
 Key cryptography is not here: every derivation, seal and open goes through `weirdnet-keys`,
 and key backups and recovery stay there. Shard blobs and backups cross the network as opaque
 bytes. See `SECURITY.md` for the boundaries and what has not been checked.
 
 ```rust
-use weirdnet_net::{WEIRDNET, Keypair, exchange::Token, profile::invite_scope};
+use weirdnet_net::{WEIRDNET, Keypair, Profile, exchange::Token, profile::invite_scope};
+
+// The Weirdnet profile, with invitation links on the app's own scheme.
+const GARDEN: Profile = Profile {
+    join_link: "weirdnet-garden://join/",
+    answer_link: "weirdnet-garden://answer/",
+    link_mark: "weirdnet-garden://",
+    ..WEIRDNET
+};
 
 let (anna, ben) = (Keypair::generate_ed25519(), Keypair::generate_ed25519());
-let p = &WEIRDNET;
+let p = &GARDEN;
 let (offer, secret) = p.offer(&anna, "anna", vec![], invite_scope("garden", "member"), 0, 60_000).unwrap();
 let link = p.link(&p.offer_token(&offer).unwrap());
+assert!(link.starts_with("weirdnet-garden://join/"));
 let Token::Offer(seen) = p.parse_token(&link).unwrap() else { unreachable!() };
 p.verify_offer(&seen, 1).unwrap();
 let (answer, on_ben) = p.answer(&ben, &seen, "ben", vec![], 1).unwrap();
