@@ -150,8 +150,10 @@ changes for them.
 
 Invitation and answer links go on the app's own scheme, `weirdnet-<app>://` (for example
 `weirdnet-morph://join/`): set `join_link`, `answer_link` and `link_mark` in the app's
-profile, as below. The bare `weirdnet://` scheme is reserved for internal Weirdnet messages;
-it is not registered with the OS and nothing routes through it.
+profile, as below. `WEIRDNET` has no link scheme, so `Profile::link` returns an error until
+the app sets one. The bare `weirdnet://` scheme is reserved for internal Weirdnet messages
+(`RESERVED_LINK_SCHEME`): it is not registered with the OS, nothing routes through it,
+`link` never makes a link on it and `parse_token` refuses one.
 
 Key cryptography is not here: every derivation, seal and open goes through `weirdnet-keys`,
 and key backups and recovery stay there. Shard blobs and backups cross the network as opaque
@@ -171,7 +173,7 @@ const GARDEN: Profile = Profile {
 let (anna, ben) = (Keypair::generate_ed25519(), Keypair::generate_ed25519());
 let p = &GARDEN;
 let (offer, secret) = p.offer(&anna, "anna", vec![], invite_scope("garden", "member"), 0, 60_000).unwrap();
-let link = p.link(&p.offer_token(&offer).unwrap());
+let link = p.link(&p.offer_token(&offer).unwrap()).unwrap();
 assert!(link.starts_with("weirdnet-garden://join/"));
 let Token::Offer(seen) = p.parse_token(&link).unwrap() else { unreachable!() };
 p.verify_offer(&seen, 1).unwrap();

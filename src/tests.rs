@@ -55,8 +55,6 @@ fn weirdnet_defaults_carry_no_application_brand() {
         p.identify,
         p.offer_prefix,
         p.answer_prefix,
-        p.join_link,
-        p.answer_link,
         p.offer_domain,
         p.msg_aad,
         p.cert,
@@ -69,22 +67,59 @@ fn weirdnet_defaults_carry_no_application_brand() {
     }
     assert_eq!(p.agent("1.2.3", " lab "), "weirdnet/1.2.3 (lab)");
     assert_eq!(p.agent("1.2.3", ""), "weirdnet/1.2.3");
+    assert_eq!((p.join_link, p.answer_link, p.link_mark), ("", "", ""), "no link scheme by default");
+}
+
+/// The Weirdnet profile with links on an app's own scheme, as apps set it.
+static APP: Profile =
+    Profile { join_link: "weirdnet-test://join/", answer_link: "weirdnet-test://answer/", link_mark: "weirdnet-test://", ..WEIRDNET };
+
+#[test]
+fn bare_weirdnet_links_are_never_made_or_read() {
+    let (a, b) = (kp(1), kp(2));
+    let (offer, _) = WEIRDNET.offer(&a, "anna", vec![], node_scope(), 1_000, DEFAULT_TTL_MS).unwrap();
+    let tok = WEIRDNET.offer_token(&offer).unwrap();
+    let (answer, _) = WEIRDNET.answer(&b, &offer, "ben", vec![], 2_000).unwrap();
+    let atok = WEIRDNET.answer_token(&answer).unwrap();
+    // The default profile has no link form: making one fails, tokens still work.
+    assert!(WEIRDNET.link(&tok).is_err() && WEIRDNET.link(&atok).is_err());
+    assert_eq!(WEIRDNET.link("anna").unwrap(), "anna", "not a token: unchanged");
+    assert!(WEIRDNET.is_token(&tok) && !WEIRDNET.is_token("anna"));
+    assert_eq!(WEIRDNET.unlink(" anna "), "anna", "no empty scheme matches everything");
+    assert!(matches!(WEIRDNET.parse_token(&tok), Ok(Token::Offer(_))));
+    // A profile that sets the reserved scheme gets no links on it either.
+    let bare = Profile { join_link: "weirdnet://join/", answer_link: "Weirdnet://answer/", link_mark: "weirdnet://", ..WEIRDNET };
+    assert!(bare.link(&tok).is_err() && bare.link(&atok).is_err());
+    // Links on weirdnet:// are refused when read, by every profile.
+    let body = tok.strip_prefix(WEIRDNET.offer_prefix).unwrap();
+    for p in [&WEIRDNET, &APP, &bare] {
+        for l in [format!("weirdnet://join/{body}"), format!(" WEIRDNET://join/{body}")] {
+            let e = p.parse_token(&l).unwrap_err().to_string();
+            assert!(e.contains("reserved"), "{e}");
+        }
+    }
+    // An app scheme round-trips.
+    let link = APP.link(&tok).unwrap();
+    assert!(link.starts_with("weirdnet-test://join/") && APP.is_token(&link));
+    let Token::Offer(o) = APP.parse_token(&link).unwrap() else { panic!() };
+    assert_eq!(o, offer);
+    assert!(APP.link(&atok).unwrap().starts_with("weirdnet-test://answer/"));
 }
 
 #[test]
 fn both_sides_derive_the_same_key_code_and_fingerprint() {
-    let p = &WEIRDNET;
+    let p = &APP;
     let (a, b) = (kp(1), kp(2));
     let (offer, secret) = p.offer(&a, "anna", vec!["/ip4/127.0.0.1/tcp/4747".into()], node_scope(), 1_000, DEFAULT_TTL_MS).unwrap();
     let tok = p.offer_token(&offer).unwrap();
     assert!(tok.starts_with("wnet-x1-offer:") && p.is_token(&tok));
-    let link = p.link(&tok);
-    assert!(link.starts_with("weirdnet://join/") && p.is_token(&link));
+    let link = p.link(&tok).unwrap();
+    assert!(link.starts_with("weirdnet-test://join/") && p.is_token(&link));
     let Token::Offer(o2) = p.parse_token(&format!(" {}\n{} ", &link[..20], &link[20..])).unwrap() else { panic!() };
     assert_eq!(o2, offer);
     assert_eq!(p.verify_offer(&o2, 2_000).unwrap(), a.public().to_peer_id());
     let (answer, d_b) = p.answer(&b, &o2, "ben", vec![], 2_000).unwrap();
-    let Token::Answer(a2) = p.parse_token(&p.link(&p.answer_token(&answer).unwrap())).unwrap() else { panic!() };
+    let Token::Answer(a2) = p.parse_token(&p.link(&p.answer_token(&answer).unwrap()).unwrap()).unwrap() else { panic!() };
     let d_a = p.complete(&a2, &offer, &secret[..]).unwrap();
     assert_eq!((d_a.key.0, &d_a.short_code, &d_a.fingerprint), (d_b.key.0, &d_b.short_code, &d_b.fingerprint));
     assert_eq!(normalize_code(&d_a.short_code.replace('-', " ")), d_a.short_code);
@@ -301,9 +336,9 @@ fn two_nodes_exchange_keys_and_talk_sealed() {
         o => panic!("{o:?}"),
     }
     // A invites B, B answers, both derive the key
-    let p = &WEIRDNET;
+    let p = &APP;
     let (offer, secret) = p.offer(&ka, "a", na.reachable_addrs(), invite_scope("garden", "member"), now_ms(), DEFAULT_TTL_MS).unwrap();
-    let Token::Offer(o) = p.parse_token(&p.link(&p.offer_token(&offer).unwrap())).unwrap() else { panic!() };
+    let Token::Offer(o) = p.parse_token(&p.link(&p.offer_token(&offer).unwrap()).unwrap()).unwrap() else { panic!() };
     p.verify_offer(&o, now_ms()).unwrap();
     let (answer, d_b) = p.answer(&kb, &o, "b", vec![], now_ms()).unwrap();
     let d_a = p.complete(&answer, &offer, &secret[..]).unwrap();

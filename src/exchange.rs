@@ -258,7 +258,11 @@ impl Profile {
     }
 
     /// Read an offer or answer token, or its link (whitespace and line breaks ignored).
+    /// Links on the reserved bare `weirdnet://` scheme are refused.
     pub fn parse_token(&self, s: &str) -> Result<Token> {
+        if crate::profile::reserved_link(s.trim_start()) {
+            return Err(NetError::invalid("token", "weirdnet:// is reserved; links use the app's own scheme (weirdnet-<app>://)"));
+        }
         let s: String = self.unlink(s);
         let (body, offer) = if let Some(b) = s.strip_prefix(self.offer_prefix) {
             (b, true)

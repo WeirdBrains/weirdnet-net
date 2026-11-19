@@ -6,6 +6,21 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: `WEIRDNET` has no link scheme (`join_link`, `answer_link` and `link_mark` are
+  empty), so the library never makes bare `weirdnet://join/` or `weirdnet://answer/` links.
+- Breaking: `Profile::link` returns `Result<String>`. It fails when the profile has no link
+  scheme or uses the reserved `weirdnet://`.
+- `parse_token` refuses links on `weirdnet://` (`RESERVED_LINK_SCHEME`), in any profile.
+
+### Migration
+
+- Apps that show invitation links set their own scheme in their profile:
+  `Profile { join_link: "weirdnet-<app>://join/", answer_link: "weirdnet-<app>://answer/",
+  link_mark: "weirdnet-<app>://", ..WEIRDNET }`, and handle the `Result` from `link`.
+  Tokens (`wnet-x1-offer:…`) are unchanged and still parse with `WEIRDNET`.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added

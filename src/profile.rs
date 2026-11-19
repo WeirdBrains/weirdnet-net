@@ -27,7 +27,11 @@ pub struct Profile {
     pub offer_prefix: &'static str,
     pub answer_prefix: &'static str,
     pub token_mark: &'static str,
-    /// Link forms of offers (invitations) and answers, and the scheme both share.
+    /// Link forms of offers (invitations) and answers, and the scheme both share. They are
+    /// the application's own scheme (`weirdnet-<app>://join/`, `weirdnet-<app>://answer/`,
+    /// `weirdnet-<app>://`). Empty means the profile has no link form: [`Profile::link`]
+    /// refuses, and only tokens are read. The bare `weirdnet://` scheme is reserved
+    /// ([`RESERVED_LINK_SCHEME`]): links on it are never made or read.
     pub join_link: &'static str,
     pub answer_link: &'static str,
     pub link_mark: &'static str,
@@ -62,7 +66,12 @@ pub struct Profile {
     pub scopes: ScopeCheck,
 }
 
-/// Weirdnet's own identifiers, the default for new applications.
+/// The bare scheme reserved for internal Weirdnet messages. Nothing routes through it, so
+/// [`Profile::link`] never makes a link on it and parsing refuses one.
+pub const RESERVED_LINK_SCHEME: &str = "weirdnet://";
+
+/// Weirdnet's own identifiers, the default for new applications. It has no link scheme:
+/// an application that shows invitation links sets its own (see [`Profile::join_link`]).
 pub const WEIRDNET: Profile = Profile {
     name: "weirdnet",
     protocol: "/weirdnet/net/1",
@@ -72,9 +81,9 @@ pub const WEIRDNET: Profile = Profile {
     offer_prefix: "wnet-x1-offer:",
     answer_prefix: "wnet-x1-answer:",
     token_mark: "wnet-x1-",
-    join_link: "weirdnet://join/",
-    answer_link: "weirdnet://answer/",
-    link_mark: "weirdnet://",
+    join_link: "",
+    answer_link: "",
+    link_mark: "",
     offer_domain: "weirdnet/net/offer/v1",
     answer_domain: "weirdnet/net/answer/v1",
     transcript_domain: "weirdnet/net/exchange/v1",
@@ -145,23 +154,35 @@ impl Profile {
         a
     }
 
-    /// The link form of a token (one address to pass on); anything else unchanged.
-    pub fn link(&self, token: &str) -> String {
-        if let Some(b) = token.strip_prefix(self.offer_prefix) {
-            format!("{}{b}", self.join_link)
+    /// The link form of a token (one address to pass on); anything else unchanged. Fails
+    /// when the profile has no link scheme (as [`WEIRDNET`]) or uses the reserved bare
+    /// `weirdnet://` one.
+    pub fn link(&self, token: &str) -> Result<String> {
+        let (scheme, body) = if let Some(b) = token.strip_prefix(self.offer_prefix) {
+            (self.join_link, b)
         } else if let Some(b) = token.strip_prefix(self.answer_prefix) {
-            format!("{}{b}", self.answer_link)
+            (self.answer_link, b)
         } else {
-            token.to_string()
+            return Ok(token.to_string());
+        };
+        if scheme.is_empty() {
+            return Err(NetError::invalid(
+                "link",
+                "this profile has no link scheme; set join_link and answer_link to the app's own (weirdnet-<app>://join/)",
+            ));
         }
+        if reserved_link(scheme) {
+            return Err(NetError::invalid("link", "weirdnet:// is reserved; links use the app's own scheme (weirdnet-<app>://)"));
+        }
+        Ok(format!("{scheme}{body}"))
     }
 
     /// A token from a link or a token, with whitespace and line breaks dropped.
     pub fn unlink(&self, input: &str) -> String {
         let s: String = input.split_whitespace().collect();
-        if let Some(b) = s.strip_prefix(self.join_link) {
+        if let Some(b) = s.strip_prefix(self.join_link).filter(|_| !self.join_link.is_empty()) {
             format!("{}{}", self.offer_prefix, b.trim_end_matches('/'))
-        } else if let Some(b) = s.strip_prefix(self.answer_link) {
+        } else if let Some(b) = s.strip_prefix(self.answer_link).filter(|_| !self.answer_link.is_empty()) {
             format!("{}{}", self.answer_prefix, b.trim_end_matches('/'))
         } else {
             s
@@ -171,6 +192,11 @@ impl Profile {
     /// Does this look like one of this profile's tokens or links (rather than a name)?
     pub fn is_token(&self, input: &str) -> bool {
         let t = input.trim();
-        t.starts_with(self.token_mark) || t.starts_with(self.link_mark)
+        t.starts_with(self.token_mark) || (!self.link_mark.is_empty() && t.starts_with(self.link_mark))
     }
+}
+
+/// Is this on the reserved bare `weirdnet://` scheme (any case)?
+pub(crate) fn reserved_link(s: &str) -> bool {
+    s.get(..RESERVED_LINK_SCHEME.len()).is_some_and(|h| h.eq_ignore_ascii_case(RESERVED_LINK_SCHEME))
 }

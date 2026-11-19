@@ -30,7 +30,7 @@ pub use libp2p::identity::{Keypair, PublicKey};
 pub use libp2p::{Multiaddr, PeerId};
 pub use node::{Handler, Message, Node, NodeConfig, RelayLimits, Sighting, Status};
 pub use peers::{DiscoveryMode, PeerHint, decode_peers, encode_peers};
-pub use profile::{Profile, WEIRDNET};
+pub use profile::{Profile, RESERVED_LINK_SCHEME, WEIRDNET};
 pub use stream::{Incoming, Limits, Path, Stream};
 pub use weirdnet_keys::{Key32, Sealed};
 pub use wss::WssTls;
