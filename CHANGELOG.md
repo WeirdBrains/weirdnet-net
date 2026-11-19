@@ -6,6 +6,33 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking (wire): requests and responses (`Node<Q, R>` and the names protocol) are encoded
+  by the new `wire` codec. Every byte field (`Vec<u8>`, `[u8; N]`, any non-empty sequence
+  of `u8`) is one CBOR byte string (major type 2) instead of an array of integers, with or
+  without `serde_bytes`; everything else is laid out as before. A 240 KiB byte field takes
+  245,771 bytes on the wire instead of 468,352. Nodes on 0.8 and earlier versions cannot
+  decode each other's requests.
+- Breaking (wire): `WEIRDNET` uses `/weirdnet/net/2` and `/weirdnet/names/2` (were `/1`),
+  so a 0.8 node and an older one fail to negotiate instead of failing to decode.
+
+### Added
+
+- `wire::{to_vec, from_slice, Codec}`. Reading refuses truncated input, trailing bytes,
+  lengths past the end, indefinite lengths, tags, and nesting deeper than `MAX_DEPTH`.
+
+### Migration
+
+- Upgrade every node that talks to each other together. Apps with their own `Profile` bump
+  its `protocol` and `names` ids (for example `/myapp/net/1` → `/myapp/net/2`) in the same
+  release.
+- Types that already used `serde_bytes` or a bytes visitor keep working. A `PeerId` (or
+  another type that only accepts `visit_bytes`) inside an internally tagged, adjacently
+  tagged or untagged enum, or a `flatten`ed struct, cannot be read: carry it as a string
+  there.
+- Nothing under a signature changes: certificates, records and tokens are signed over JSON.
+
 ## [0.7.0] - 2026-11-18
 
 ### Changed

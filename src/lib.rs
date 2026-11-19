@@ -20,6 +20,7 @@ pub mod shard;
 pub mod stream;
 pub mod sync;
 pub mod user;
+pub mod wire;
 pub mod wss;
 
 pub use app::{AppError, AppHandler, AppRequest, AppResponse, Body as AppBody};
@@ -69,5 +70,7 @@ mod sealed_tests;
 mod stream_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
 #[cfg(test)]
 mod wss_tests;

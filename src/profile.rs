@@ -74,7 +74,7 @@ pub const RESERVED_LINK_SCHEME: &str = "weirdnet://";
 /// an application that shows invitation links sets its own (see [`Profile::join_link`]).
 pub const WEIRDNET: Profile = Profile {
     name: "weirdnet",
-    protocol: "/weirdnet/net/1",
+    protocol: "/weirdnet/net/2",
     kad: "/weirdnet/kad/1",
     relay_key: "/weirdnet/relay/1",
     identify: "/weirdnet/id/1",
@@ -94,7 +94,7 @@ pub const WEIRDNET: Profile = Profile {
     revoke: "weirdnet-node-revoke/1",
     sync_key: "weirdnet/sync/v1/key",
     sync_aad: "weirdnet/sync/v1",
-    names: "/weirdnet/names/1",
+    names: "/weirdnet/names/2",
     peer_record: "weirdnet/peer-record/v1",
     withdrawal: "weirdnet/withdrawal/v1",
     peer_key: "weirdnet/peer/",

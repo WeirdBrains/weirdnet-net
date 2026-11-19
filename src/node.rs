@@ -285,8 +285,8 @@ mod wire {
 
     #[derive(NetworkBehaviour)]
     pub(super) struct Behaviour<Q: Message, R: Message> {
-        pub(super) rr: request_response::cbor::Behaviour<Q, R>,
-        pub(super) names: request_response::cbor::Behaviour<NamesRequest, NamesResponse>,
+        pub(super) rr: request_response::Behaviour<crate::wire::Codec<Q, R>>,
+        pub(super) names: request_response::Behaviour<crate::wire::Codec<NamesRequest, NamesResponse>>,
         pub(super) identify: identify::Behaviour,
         pub(super) ping: ping::Behaviour,
         pub(super) kad: kad::Behaviour<MemoryStore>,
@@ -364,8 +364,9 @@ fn behaviour<Q: Message, R: Message>(
     cfg: &NodeConfig,
 ) -> Result<Behaviour<Q, R>> {
     let peer = key.public().to_peer_id();
-    let rr = request_response::cbor::Behaviour::with_codec(
-        request_response::cbor::codec::Codec::default().set_request_size_maximum(cfg.req_max()).set_response_size_maximum(cfg.resp_max()),
+    // byte fields go as CBOR byte strings (crate::wire), not arrays of integers
+    let rr = request_response::Behaviour::with_codec(
+        crate::wire::Codec::new(cfg.req_max(), cfg.resp_max()),
         [(StreamProtocol::new(p.protocol), ProtocolSupport::Full)],
         request_response::Config::default().with_request_timeout(cfg.req_timeout()),
     );
@@ -380,8 +381,8 @@ fn behaviour<Q: Message, R: Message>(
     kcfg.set_query_timeout(Duration::from_secs(30));
     // every record and provider a peer puts is checked first (peer records, relay keys)
     kcfg.set_record_filtering(kad::StoreInserts::FilterBoth);
-    let names = request_response::cbor::Behaviour::with_codec(
-        request_response::cbor::codec::Codec::default().set_request_size_maximum(64 * 1024).set_response_size_maximum(64 * 1024),
+    let names = request_response::Behaviour::with_codec(
+        crate::wire::Codec::new(64 * 1024, 64 * 1024),
         [(StreamProtocol::new(p.names), if cfg.names_server.is_some() { ProtocolSupport::Full } else { ProtocolSupport::Outbound })],
         request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
     );

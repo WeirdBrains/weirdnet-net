@@ -8,7 +8,8 @@ response types, its own storage and its own policy; the crate brings the wire.
 - `node`: a `Node<Q, R>` over TCP and QUIC (or an in-memory transport for tests) with Noise
   and Yamux, mDNS, Kademlia, identify, ping, a relay client and an opt-in relay server,
   DCUtR hole punching and AutoNAT. The swarm runs on its own thread; the handle is blocking.
-  Requests are the application's `Q`, answers its `R` (CBOR), answered by a `Handler`.
+  Requests are the application's `Q`, answers its `R` (CBOR, through `wire`), answered by a
+  `Handler`.
   `NodeConfig::relay_limits` sets what the relay server allows: `RelayLimits::default()`
   keeps libp2p's (2-minute, 128 KiB circuits, enough for hole punching and small requests),
   `RelayLimits::unlimited()` caps nothing, so circuits carry data.
@@ -103,11 +104,15 @@ response types, its own storage and its own policy; the crate brings the wire.
   cap on pending requests, and keeps it in the app's `JoinQueue`. The owner `approve`s (a
   membership) or `deny`s (a signed `Denial`), and sending the same request again fetches the
   answer.
+- `wire`: the request-response codec. CBOR in which every byte field (`Vec<u8>`, `[u8; N]`,
+  any non-empty sequence of `u8`) is one byte string, not an array of integers, whether or
+  not it is marked `serde_bytes`, so a 240 KiB blob costs 240 KiB and 11 bytes instead of
+  about 457 KiB. `to_vec` and `from_slice` are public for measuring and for tests.
 - `names`: where a peer is now. A `PeerRecord` (addresses and relay circuits, home relay,
   `seq`, expiry of at most a day) is signed by the node key and chained to the user key by
   the node's certificate; a `Withdrawal`, signed by one of the user's nodes with a higher
   `seq`, removes it and holds until it expires. Records go to the home relay's names server
-  (`/weirdnet/names/1`: `Node::register`, `discover`, `lookup`; a node serves it with
+  (`/weirdnet/names/2`: `Node::register`, `discover`, `lookup`; a node serves it with
   `NodeConfig::names_server`) and, while the device hosts something, to the Kademlia DHT
   under `SHA-256("weirdnet/peer/" + user id)` (`put_entry`, `get_entries`), where every
   storing node runs `Profile::accept`: valid signature, unrevoked certificate, unexpired,
@@ -144,9 +149,11 @@ stays on the relay, QUIC to the relay, mDNS on a LAN, and AutoNAT verdicts, each
 content fetch. Run it with `sudo harness/netns.sh target/debug/examples/netns_node`.
 
 Every identifier on the wire or under a signature comes from a `Profile`. `WEIRDNET` is the
-default (`/weirdnet/net/1`, `wnet-x1-offer:`, port 4747 and so on). An application with nodes
-already in the field passes its own profile with the values those nodes use, so nothing
-changes for them.
+default (`/weirdnet/net/2`, `wnet-x1-offer:`, port 4747 and so on). An application with nodes
+already in the field passes its own profile with the values those nodes use. Since 0.8.0
+the request-response encoding differs from earlier versions (see `wire`), so an app that
+upgrades should bump its `protocol` and `names` ids too: an old and a new node then fail
+to negotiate, clearly, instead of failing to decode.
 
 Invitation and answer links go on the app's own scheme, `weirdnet-<app>://` (for example
 `weirdnet-morph://join/`): set `join_link`, `answer_link` and `link_mark` in the app's
