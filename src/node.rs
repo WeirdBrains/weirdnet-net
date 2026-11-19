@@ -2130,17 +2130,16 @@ impl<Q: Message, R: Message> Loop<Q, R> {
             }
             BehaviourEvent::Kad(kad::Event::InboundRequest { request }) => match request {
                 kad::InboundRequest::PutRecord { record: Some(rec), source, .. } => self.inbound_put(rec, source),
-                kad::InboundRequest::AddProvider { record: Some(rec) } => {
-                    // nodes announce the relay key and content roots, nothing else
-                    if rec.key.as_ref() == self.profile.relay_key.as_bytes() || crate::content::is_provider_key(rec.key.as_ref()) {
-                        let mut rec = rec;
-                        // a provider that sent no addresses is answered with the ones we know,
-                        // or others could not reach it
-                        if rec.addresses.is_empty() {
-                            rec.addresses = self.heard.get(&rec.provider).or_else(|| self.addr_book.get(&rec.provider)).cloned().unwrap_or_default();
-                        }
-                        let _ = self.swarm.behaviour_mut().kad.store_mut().add_provider(rec);
+                // nodes announce the relay key and content roots, nothing else
+                kad::InboundRequest::AddProvider { record: Some(mut rec) }
+                    if rec.key.as_ref() == self.profile.relay_key.as_bytes() || crate::content::is_provider_key(rec.key.as_ref()) =>
+                {
+                    // a provider that sent no addresses is answered with the ones we know,
+                    // or others could not reach it
+                    if rec.addresses.is_empty() {
+                        rec.addresses = self.heard.get(&rec.provider).or_else(|| self.addr_book.get(&rec.provider)).cloned().unwrap_or_default();
                     }
+                    let _ = self.swarm.behaviour_mut().kad.store_mut().add_provider(rec);
                 }
                 _ => {}
             },
