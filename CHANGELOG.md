@@ -6,6 +6,10 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Android: `android::init_context` and the `android_context_init!` macro, which exports an app's JNI init method, so every Weirdnet Android app sets up `ndk-context` (needed by hickory-resolver's system DNS) the same way instead of carrying its own copy. The macro expands to nothing on other targets.
+
 ## [0.8.0] - 2026-11-18
 
 ### Changed

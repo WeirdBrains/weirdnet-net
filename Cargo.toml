@@ -36,6 +36,11 @@ chacha20poly1305 = "0.10"
 # app call heads (the same CBOR crate libp2p uses)
 cbor4ii = { version = "1.2", features = ["serde1", "use_std"] }
 
+# Android: ndk-context initialization for hickory-resolver's system DNS (src/android.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.4.1"
+ndk-context = "0.1.1"
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = "0.13"

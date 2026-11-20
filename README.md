@@ -81,6 +81,11 @@ response types, its own storage and its own policy; the crate brings the wire.
   (`dnsaddr=/dns/<name>/tcp/<port>/p2p/<peer>`) for Grindvakt or any DNS provider to write, and
   `dnsaddr_dial(name, peer)` to reach the node by it. `NodeConfig::dns_servers` picks the
   resolver; without it the system's is used, or public resolvers where there is none (Android).
+- Android: `android_context_init!(Java_<package>_<Class>_<method>)` exports the JNI method an
+  app's Kotlin calls once at startup (before any node starts) to hand `ndk-context` the JavaVM
+  and application Context; `android::init_context` (Android builds only) does the work. Without
+  it, hickory-resolver panics when it reads the system DNS servers. On other targets the macro
+  expands to nothing.
 - `content`: files by content. `add_reader`/`add_bytes` split a file into content-defined
   chunks (an rsync-style rolling checksum, 16 to 256 KiB) in the application's `ChunkStore`
   (`MemoryStore`, `DirStore` or its own) and return a `FileIndex`; the file's root is the
