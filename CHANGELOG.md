@@ -6,6 +6,8 @@ All notable changes to weirdnet-net are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-19
+
 ### Added
 
 - Android: `android::init_context` and the `android_context_init!` macro, which exports an app's JNI init method, so every Weirdnet Android app sets up `ndk-context` (needed by hickory-resolver's system DNS) the same way instead of carrying its own copy. The macro expands to nothing on other targets.
@@ -149,7 +151,8 @@ All notable changes to weirdnet-net are listed here. The format follows
 - First release, extracted from Muninn: the Weirdnet libp2p node with identities, Kademlia,
   relays, hole punching and request-response protocols.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/WeirdBrains/weirdnet-net/compare/v0.5.0...v0.6.0

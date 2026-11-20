@@ -1,6 +1,6 @@
 [package]
 name = "weirdnet-net"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Weirdnet networking: a libp2p node (TCP, QUIC, Noise, Yamux, mDNS, Kademlia, relays, hole punching, AutoNAT) carrying the application's own request and response types, signed key-exchange offers and answers with short codes, invitation tokens and links, sealed exchange messaging, node identities, user certificates and cards, under versioned identifier profiles."
